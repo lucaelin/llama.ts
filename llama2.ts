@@ -5,72 +5,15 @@
 //
 // Use bun or t348 to run. see params at the end of the file or in the README.
 import * as fs from "node:fs";
-import { Buffer } from "node:buffer";
 import { writeAllSync } from "https://deno.land/std/io/mod.ts";
+import { readHFRepo, TransformersModel } from "./safetensors.ts";
 
 // ----------------------------------------------------------------------------
 // binary utils
 
 type float = number;
 type int = number;
-const f32bytes = 4;
-const i32bytes = 4;
-class BufferReader {
-  view: DataView;
-  position: number;
-  constructor(buffer: Buffer) {
-    this.view = new DataView(
-      buffer.buffer,
-      buffer.byteOffset,
-      buffer.byteLength,
-    );
-    this.position = 0;
-  }
 
-  getInt32LE(): int {
-    let value = this.view.getInt32(this.position, true);
-    this.position += i32bytes;
-    return value;
-  }
-
-  getFloat32LE(): float {
-    let value = this.view.getFloat32(this.position, true);
-    this.position += f32bytes;
-    return value;
-  }
-
-  getBytesInto(bytes: Uint8Array) {
-    bytes.set(new Uint8Array(this.view.buffer, this.position, bytes.length));
-    this.position += bytes.length;
-    return bytes;
-  }
-}
-
-class FileHandleReader {
-  handle: number;
-  position: number;
-  constructor(handle: number, offset: number) {
-    this.handle = handle;
-    this.position = offset;
-  }
-  getF32Array(...dims: number[]): Float32Array {
-    let totalFloats = dims.reduce((a, b) => a * b);
-    //    console.log({offset, dims, totalBytes, bb:this.view.buffer.length})
-    let bytes = Buffer.alloc(totalFloats * f32bytes);
-    fs.readSync(this.handle, bytes, 0, bytes.length, this.position);
-    let ret = new Float32Array(bytes.buffer, bytes.byteOffset, totalFloats);
-    this.position += totalFloats * f32bytes;
-    return ret;
-  }
-
-  getF32Arrays(dim0: number, ...dims: number[]): Float32Array[] {
-    let array = new Array(dim0);
-    for (let i = 0; i < dim0; ++i) {
-      array[i] = this.getF32Array(...dims);
-    }
-    return array;
-  }
-}
 interface Config {
   dim: int;
   hidden_dim: int;
@@ -79,22 +22,8 @@ interface Config {
   n_kv_heads: int;
   vocab_size: int;
   seq_len: int;
-  shared_weights: boolean;
   head_size: int;
-}
-function readConfig(buffer: BufferReader): Config {
-  let c = {} as Config;
-  c.dim = buffer.getInt32LE();
-  c.hidden_dim = buffer.getInt32LE();
-  c.n_layers = buffer.getInt32LE();
-  c.n_heads = buffer.getInt32LE();
-  c.n_kv_heads = buffer.getInt32LE();
-  let vocab_size = buffer.getInt32LE();
-  c.vocab_size = Math.abs(vocab_size);
-  c.seq_len = buffer.getInt32LE();
-  c.shared_weights = vocab_size > 0;
-  c.head_size = c.dim / c.n_heads;
-  return c;
+  norm_eps?: float;
 }
 
 interface TransformerWeights {
@@ -109,64 +38,7 @@ interface TransformerWeights {
   w2: Float32Array[];
   w3: Float32Array[];
   rms_final_weight: Float32Array;
-  freq_cis_real: Float32Array;
-  freq_cis_imag: Float32Array;
   wcls: Float32Array;
-}
-
-function readWeights(
-  config: Config,
-  buffer: FileHandleReader,
-  shared_weights: boolean,
-): TransformerWeights {
-  let w = {} as TransformerWeights;
-  console.log(
-    config.n_layers,
-    config.dim,
-    config.n_heads,
-    config.n_kv_heads,
-    config.head_size,
-  );
-  w.token_embedding_table = buffer.getF32Array(config.vocab_size, config.dim);
-  console.log("w.token_embedding_table[0]: ", w.token_embedding_table[0]);
-  w.rms_att_weight = buffer.getF32Arrays(config.n_layers, config.dim);
-  console.log("w.rms_att_weight[0][0]: %f", w.rms_att_weight[1][0]);
-  w.wq = buffer.getF32Arrays(
-    config.n_layers,
-    config.dim,
-    config.n_heads * config.head_size,
-  );
-  console.log("w.wq[0][0]: %f", w.wq[1][0]);
-  w.wk = buffer.getF32Arrays(
-    config.n_layers,
-    config.dim,
-    config.n_kv_heads * config.head_size,
-  );
-  console.log("w.wk[0][0]: %f", w.wk[1][0]);
-  w.wv = buffer.getF32Arrays(
-    config.n_layers,
-    config.dim,
-    config.n_kv_heads * config.head_size,
-  );
-  console.log("w.wv[0][0]: %f", w.wv[1][0]);
-  w.wo = buffer.getF32Arrays(
-    config.n_layers,
-    config.n_heads * config.head_size,
-    config.dim,
-  );
-  console.log("w.wo[0][0]: %f", w.wo[1][0]);
-  w.rms_ffn_weight = buffer.getF32Arrays(config.n_layers, config.dim); // jagged pointer arithmetic lol
-  console.log("w.rms_ffn_weight[0][0]: %f", w.rms_ffn_weight[1][0]);
-  w.w1 = buffer.getF32Arrays(config.n_layers, config.hidden_dim, config.dim);
-  w.w2 = buffer.getF32Arrays(config.n_layers, config.dim, config.hidden_dim);
-  w.w3 = buffer.getF32Arrays(config.n_layers, config.hidden_dim, config.dim);
-  w.rms_final_weight = buffer.getF32Array(config.dim);
-  w.freq_cis_real = buffer.getF32Array(config.seq_len, config.head_size / 2);
-  w.freq_cis_imag = buffer.getF32Array(config.seq_len, config.head_size / 2);
-  w.wcls = shared_weights
-    ? w.token_embedding_table
-    : buffer.getF32Array(config.vocab_size, config.dim);
-  return w;
 }
 
 interface RunState {
@@ -404,7 +276,6 @@ function encode(
   eos: boolean,
   vocab: string[],
   vocab_scores: number[],
-  vocab_size: number,
   tokens: Int32Array,
 ) {
   // first encode every individual byte in the input string
@@ -580,10 +451,156 @@ function decode(vocab: string[], prev_token: number, token: number): string {
   return piece;
 }
 
-// ----------------------------------------------------------------------------
-// int main
+function permuteReverse(
+  w: Float32Array,
+  n_heads: number,
+  dim1: number,
+  dim2: number,
+): Float32Array {
+  const newShape = [n_heads, 2, Math.floor(dim1 / n_heads / 2), dim2];
+
+  // Reshape w into newShape
+  const reshaped: number[][][][] = [];
+  let index = 0;
+  for (let i = 0; i < newShape[0]; i++) {
+    reshaped[i] = [];
+    for (let j = 0; j < newShape[1]; j++) {
+      reshaped[i][j] = [];
+      for (let k = 0; k < newShape[2]; k++) {
+        reshaped[i][j][k] = [];
+        for (let l = 0; l < newShape[3]; l++) {
+          reshaped[i][j][k][l] = w[index++];
+        }
+      }
+    }
+  }
+
+  // Transpose (1, 2) => (0, 2, 1, 3)
+  const transposed: number[][][][] = [];
+  for (let i = 0; i < newShape[0]; i++) {
+    transposed[i] = [];
+    for (let k = 0; k < newShape[2]; k++) {
+      transposed[i][k] = [];
+      for (let j = 0; j < newShape[1]; j++) {
+        transposed[i][k][j] = reshaped[i][j][k];
+      }
+    }
+  }
+
+  // Flatten the transposed array and reshape it into [dim1, dim2]
+  const flattened: number[] = [];
+  for (let i = 0; i < newShape[0]; i++) {
+    for (let k = 0; k < newShape[2]; k++) {
+      for (let j = 0; j < newShape[1]; j++) {
+        for (let l = 0; l < newShape[3]; l++) {
+          flattened.push(transposed[i][k][j][l]);
+        }
+      }
+    }
+  }
+
+  const result = new Float32Array(dim1 * dim2);
+  for (let i = 0; i < result.length; i++) {
+    result[i] = flattened[i];
+  }
+
+  return result;
+}
+
+function readTokenizer(tokenizerPath: string, vocab_size: number) {
+  let vocab = new Array<string>(vocab_size);
+  let vocab_scores = new Array<number>(vocab_size);
+  let tokBuffer = fs.readFileSync(tokenizerPath);
+  let tokBufferOffset = 0;
+  let _ignored_max_token_length = tokBuffer.readInt32LE(tokBufferOffset);
+  tokBufferOffset += 4;
+  for (let i = 0; i < vocab_size; i++) {
+    vocab_scores[i] = tokBuffer.readFloatLE(tokBufferOffset);
+    tokBufferOffset += 4;
+
+    const token_length = tokBuffer.readInt32LE(tokBufferOffset);
+    tokBufferOffset += 4;
+
+    const bytes = new Uint8Array(token_length);
+    for (let j = 0; j < token_length; j++) {
+      bytes[j] = tokBuffer.readUInt8(tokBufferOffset);
+      tokBufferOffset += 1;
+    }
+
+    vocab[i] = new TextDecoder().decode(bytes);
+  }
+
+  return { vocab, vocab_scores };
+}
+
+function readModel(
+  hfConfig: TransformersModel["config"],
+  hfWeights: TransformersModel["weights"],
+) {
+  const config: Config = {
+    dim: hfConfig.hidden_size,
+    hidden_dim: hfConfig.intermediate_size,
+    head_size: hfConfig.hidden_size / hfConfig.num_attention_heads,
+    n_heads: hfConfig.num_attention_heads,
+    n_kv_heads: hfConfig.num_key_value_heads,
+    n_layers: hfConfig.num_hidden_layers,
+    seq_len: hfConfig.max_position_embeddings,
+    vocab_size: hfConfig.vocab_size,
+    norm_eps: hfConfig.rms_norm_eps,
+  };
+
+  const weights: TransformerWeights = {
+    token_embedding_table: new Float32Array(
+      hfWeights.model.embed_tokens.weight.weights,
+    ),
+    rms_att_weight: hfWeights.model.layers.map((l) =>
+      new Float32Array(l.input_layernorm.weight.weights)
+    ),
+    wq: hfWeights.model.layers.map((l) =>
+      permuteReverse(
+        new Float32Array(l.self_attn.q_proj.weight.weights),
+        config.n_heads,
+        config.dim,
+        config.dim,
+      )
+    ),
+    wk: hfWeights.model.layers.map((l) =>
+      permuteReverse(
+        new Float32Array(l.self_attn.k_proj.weight.weights),
+        config.n_kv_heads,
+        Math.floor(config.dim / config.n_heads) * config.n_kv_heads,
+        config.dim,
+      )
+    ),
+    wv: hfWeights.model.layers.map((l) =>
+      new Float32Array(l.self_attn.v_proj.weight.weights)
+    ),
+    wo: hfWeights.model.layers.map((l) =>
+      new Float32Array(l.self_attn.o_proj.weight.weights)
+    ),
+    rms_ffn_weight: hfWeights.model.layers.map((l) =>
+      new Float32Array(l.post_attention_layernorm.weight.weights)
+    ),
+    w1: hfWeights.model.layers.map((l) =>
+      new Float32Array(l.mlp.gate_proj.weight.weights)
+    ),
+    w2: hfWeights.model.layers.map((l) =>
+      new Float32Array(l.mlp.down_proj.weight.weights)
+    ),
+    w3: hfWeights.model.layers.map((l) =>
+      new Float32Array(l.mlp.up_proj.weight.weights)
+    ),
+    rms_final_weight: new Float32Array(hfWeights.model.norm.weight.weights),
+    wcls: new Float32Array(
+      hfWeights.lm_head?.weight?.weights ??
+        hfWeights.model.embed_tokens.weight.weights,
+    ),
+  };
+
+  return { config, weights };
+}
+
 function main() {
-  // defaults
   //console.log(Deno.args);
   const [checkpoint, ...args] = Deno.args;
   let temperature = 1.0; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
@@ -621,36 +638,21 @@ function main() {
   }
   if (rng_seed == 0n) rng_seed = BigInt(Date.now());
 
-  // read in the model.bin file
-  let fileHandle = fs.openSync(checkpoint, "r");
-  let configSize = 7 * i32bytes;
-
-  // read in the config header
-  let configBuffer = Buffer.alloc(configSize);
-  fs.readSync(fileHandle, configBuffer, 0, configSize, 0);
-  let config = readConfig(new BufferReader(configBuffer));
-  //console.error(config);
-  let weights = readWeights(
-    config,
-    new FileHandleReader(fileHandle, configSize),
-    config.shared_weights,
+  const { config: hfConfig, weights: hfWeights } = readHFRepo(
+    checkpoint + "/config.json",
+    checkpoint + "/model.safetensors",
   );
-  fs.closeSync(fileHandle);
+  const { config, weights } = readModel(hfConfig, hfWeights);
 
   // right now we cannot run for more than config.seq_len steps
   if (steps <= 0 || steps > config.seq_len) steps = config.seq_len;
 
   // read in the tokenizer.bin file
-  let vocab = new Array<string>(config.vocab_size);
-  let vocab_scores = new Array<number>(config.vocab_size);
-  let tokBuffer = new BufferReader(fs.readFileSync("tokenizer.bin"));
-  let _ignored_max_token_length = tokBuffer.getInt32LE();
-  for (let i = 0; i < config.vocab_size; i++) {
-    vocab_scores[i] = tokBuffer.getFloat32LE();
-    vocab[i] = new TextDecoder().decode(
-      tokBuffer.getBytesInto(new Uint8Array(tokBuffer.getInt32LE())),
-    );
-  }
+  const { vocab, vocab_scores } = readTokenizer(
+    "tokenizer.bin",
+    config.vocab_size,
+  );
+
   // create and init the application RunState
   let state = newRunState(config);
   if (prompt == null) prompt = "";
@@ -665,14 +667,7 @@ function main() {
     false, // no eos
     vocab,
     vocab_scores,
-    config.vocab_size,
     prompt_tokens,
-  );
-  console.log(
-    "Prompt tokens: %d %d %d",
-    prompt_tokens[0],
-    prompt_tokens[1],
-    prompt_tokens[2],
   );
 
   // start the main loop
