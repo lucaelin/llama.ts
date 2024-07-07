@@ -1,9 +1,12 @@
+// deno-lint-ignore-file prefer-const
 // Llama2 transformer model inference in one TypeScript file.
 // by Oleksandr Nikitin, 2023 (MIT licensed).
 // Based on the Andrej Karpathy's llama2.c: https://github.com/karpathy/llama2.c
 //
 // Use bun or t348 to run. see params at the end of the file or in the README.
-import * as fs from "fs";
+import * as fs from "node:fs";
+import { Buffer } from "node:buffer";
+import { writeAllSync } from "https://deno.land/std/io/mod.ts";
 
 // ----------------------------------------------------------------------------
 // binary utils
@@ -117,13 +120,43 @@ function readWeights(
   shared_weights: boolean,
 ): TransformerWeights {
   let w = {} as TransformerWeights;
+  console.log(
+    config.n_layers,
+    config.dim,
+    config.n_heads,
+    config.n_kv_heads,
+    config.head_size,
+  );
   w.token_embedding_table = buffer.getF32Array(config.vocab_size, config.dim);
+  console.log("w.token_embedding_table[0]: ", w.token_embedding_table[0]);
   w.rms_att_weight = buffer.getF32Arrays(config.n_layers, config.dim);
-  w.wq = buffer.getF32Arrays(config.n_layers, config.dim, config.dim);
-  w.wk = buffer.getF32Arrays(config.n_layers, config.dim, config.dim);
-  w.wv = buffer.getF32Arrays(config.n_layers, config.dim, config.dim);
-  w.wo = buffer.getF32Arrays(config.n_layers, config.dim, config.dim);
+  console.log("w.rms_att_weight[0][0]: %f", w.rms_att_weight[1][0]);
+  w.wq = buffer.getF32Arrays(
+    config.n_layers,
+    config.dim,
+    config.n_heads * config.head_size,
+  );
+  console.log("w.wq[0][0]: %f", w.wq[1][0]);
+  w.wk = buffer.getF32Arrays(
+    config.n_layers,
+    config.dim,
+    config.n_kv_heads * config.head_size,
+  );
+  console.log("w.wk[0][0]: %f", w.wk[1][0]);
+  w.wv = buffer.getF32Arrays(
+    config.n_layers,
+    config.dim,
+    config.n_kv_heads * config.head_size,
+  );
+  console.log("w.wv[0][0]: %f", w.wv[1][0]);
+  w.wo = buffer.getF32Arrays(
+    config.n_layers,
+    config.n_heads * config.head_size,
+    config.dim,
+  );
+  console.log("w.wo[0][0]: %f", w.wo[1][0]);
   w.rms_ffn_weight = buffer.getF32Arrays(config.n_layers, config.dim); // jagged pointer arithmetic lol
+  console.log("w.rms_ffn_weight[0][0]: %f", w.rms_ffn_weight[1][0]);
   w.w1 = buffer.getF32Arrays(config.n_layers, config.hidden_dim, config.dim);
   w.w2 = buffer.getF32Arrays(config.n_layers, config.dim, config.hidden_dim);
   w.w3 = buffer.getF32Arrays(config.n_layers, config.hidden_dim, config.dim);
@@ -153,7 +186,8 @@ interface RunState {
   indices: { prob: float; index: int }[];
 }
 function newRunState(config: Config): RunState {
-  let s = {} as RunState;
+  const kv_dim = (config.dim * config.n_kv_heads) / config.n_heads;
+  const s = {} as RunState;
   s.indices = new Array(config.vocab_size);
   s.x = new Float32Array(config.dim);
   s.xb = new Float32Array(config.dim);
@@ -165,9 +199,9 @@ function newRunState(config: Config): RunState {
   s.v = new Float32Array(config.dim);
   s.att = new Float32Array(config.n_heads * config.seq_len);
   s.logits = new Float32Array(config.vocab_size);
-  s.key_cache = new Float32Array(config.n_layers * config.seq_len * config.dim);
+  s.key_cache = new Float32Array(config.n_layers * config.seq_len * kv_dim);
   s.value_cache = new Float32Array(
-    config.n_layers * config.seq_len * config.dim,
+    config.n_layers * config.seq_len * kv_dim,
   );
   return s;
 }
@@ -193,18 +227,23 @@ function rmsnorm(
   // debugger;
 }
 
-function softmax(x: Float32Array, xPtr: number, size: number): void {
-  let max_val = x[xPtr];
+function softmax(x: Float32Array, size: number): void {
+  // find max value (for numerical stability)
+  let max_val = x[0];
   for (let i = 1; i < size; i++) {
-    if (x[i + xPtr] > max_val) max_val = x[i + xPtr];
+    if (x[i] > max_val) max_val = x[i];
   }
-  for (let i = 0; i < size; i++) {
-    x[i + xPtr] = Math.exp(x[i + xPtr] - max_val);
-  }
+
+  // exp and sum
   let sum = 0;
-  for (let i = 0; i < size; i++) sum += x[i + xPtr];
   for (let i = 0; i < size; i++) {
-    x[i + xPtr] /= sum; //Accumulator[0]; // ah forget it, it's numerically stable enough
+    x[i] = Math.exp(x[i] - max_val);
+    sum += x[i];
+  }
+
+  // normalize
+  for (let i = 0; i < size; i++) {
+    x[i] /= sum; //Accumulator[0]; // ah forget it, it's numerically stable enough
   }
 }
 
@@ -218,12 +257,14 @@ function matmul(
   // W (d, n) @ x (n,) -> xout (d,)
   for (let i = 0; i < d; i++) {
     let sum = 0;
-    for (let j = 0; j < n; j++) sum += w[i * n + j] * x[j];
+    for (let j = 0; j < n; j++) {
+      sum += w[i * n + j] * x[j];
+    }
     xout[i] = sum; //sumAccumulator[0];
   }
 }
 
-function transformer(
+function forward(
   token: number,
   pos: number,
   p: Config,
@@ -232,63 +273,91 @@ function transformer(
 ): void {
   const x = s.x;
   const dim = p.dim;
+  const kv_dim = (p.dim * p.n_kv_heads) / p.n_heads;
+  const kv_mul = p.n_heads / p.n_kv_heads; // integer multiplier of the kv sharing in multiquery
+
   const hidden_dim = p.hidden_dim;
   const head_size = dim / p.n_heads;
 
+  // copy the token embedding into x
   x.set(w.token_embedding_table.subarray(token * dim, token * dim + dim));
 
   //debugger;
   // forward all the layers
   for (let l = 0; l < p.n_layers; l++) {
+    //console.log("Layer %d", l + 1);
+    // attention rmsnorm
     rmsnorm(s.xb, x, w.rms_att_weight[l], dim);
+
+    // key and value point to the kv cache
+    const loff = l * p.seq_len * kv_dim; // kv cache layer offset for convenience
+    s.k = s.key_cache.subarray(
+      loff + pos * kv_dim,
+      loff + pos * kv_dim + kv_dim,
+    );
+    s.v = s.value_cache.subarray(
+      loff + pos * kv_dim,
+      loff + pos * kv_dim + kv_dim,
+    );
 
     // qkv matmuls for this position
     matmul(s.q, s.xb, w.wq[l], dim, dim);
-    matmul(s.k, s.xb, w.wk[l], dim, dim);
-    matmul(s.v, s.xb, w.wv[l], dim, dim);
+    matmul(s.k, s.xb, w.wk[l], dim, kv_dim);
+    matmul(s.v, s.xb, w.wv[l], dim, kv_dim);
+    //console.log("s.q[0]: %f", s.q[0]);
+    //console.log("s.k[0]: %f", s.k[0]);
+    //console.log("s.v[0]: %f", s.v[0]);
 
     // RoPE relative positional encoding: complex-valued rotate q and k by freq_cis in each head
     for (let i = 0; i < dim; i += 2) {
-      const q0 = s.q[i];
-      const q1 = s.q[i + 1];
-      const k0 = s.k[i];
-      const k1 = s.k[i + 1];
-      const fcr = w.freq_cis_real[pos * head_size / 2 + (i % head_size) / 2];
-      const fci = w.freq_cis_imag[pos * head_size / 2 + (i % head_size) / 2];
-      s.q[i] = q0 * fcr - q1 * fci;
-      s.q[i + 1] = q0 * fci + q1 * fcr;
-      s.k[i] = k0 * fcr - k1 * fci;
-      s.k[i + 1] = k0 * fci + k1 * fcr;
-    }
+      const head_dim = i % head_size;
+      const freq = 1.0 / Math.pow(10000.0, head_dim / head_size);
+      const val = pos * freq;
+      const fcr = Math.cos(val);
+      const fci = Math.sin(val);
 
-    // save key,value at this time step (pos) to our kv cache
-    const loff = l * p.seq_len * dim; // kv cache layer offset for convenience
-    s.key_cache.set(s.k, loff + pos * dim);
-    s.value_cache.set(s.v, loff + pos * dim);
-    //debugger;
+      const rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
+      for (let v = 0; v < rotn; v++) {
+        const vec = v == 0 ? s.q : s.k; // the vector to rotate (query or key)
+        const v0 = vec[i];
+        const v1 = vec[i + 1];
+        vec[i] = v0 * fcr - v1 * fci;
+        vec[i + 1] = v0 * fci + v1 * fcr;
+      }
+    }
 
     // multihead attention. iterate over all heads
     for (let h = 0; h < p.n_heads; h++) {
       let q = s.q.subarray(h * head_size, h * head_size + head_size);
-      let attPtr = h * p.seq_len;
+      let att = s.att.subarray(h * p.seq_len, h * p.seq_len + p.seq_len);
 
       // iterate over all timesteps, including the current one
       for (let t = 0; t <= pos; t++) {
-        const cached_k = s.key_cache.subarray(loff + t * dim + h * head_size);
-        let scope = 0.0;
-        for (let i = 0; i < head_size; i++) scope += q[i] * cached_k[i];
-        s.att[attPtr + t] = scope / Math.sqrt(head_size);
+        // get the key vector for this head and at this timestep
+        const k = s.key_cache.subarray(
+          loff + t * kv_dim + Math.floor(h / kv_mul) * head_size,
+          loff + t * kv_dim + Math.floor(h / kv_mul) * head_size + head_size,
+        );
+        // calculate the attention score as the dot product of q and k
+        let score = 0.0;
+        for (let i = 0; i < head_size; i++) score += q[i] * k[i];
+        // save the score to the attention buffer
+        att[t] = score / Math.sqrt(head_size);
       }
 
-      softmax(s.att, attPtr, pos + 1);
-      s.xb.fill(0, h * head_size, h * head_size + head_size);
+      softmax(att, pos + 1);
 
       // weighted sum of the values, store back into xb
+      const xb = s.xb.subarray(h * head_size, h * head_size + head_size);
+      xb.fill(0, 0, head_size);
       for (let t = 0; t <= pos; t++) {
-        const att_t = s.att[attPtr + t];
+        const v = s.value_cache.subarray(
+          loff + t * kv_dim + Math.floor(h / kv_mul) * head_size,
+          loff + t * kv_dim + Math.floor(h / kv_mul) * head_size + head_size,
+        );
+        const att_t = att[t];
         for (let i = 0; i < head_size; i++) {
-          s.xb[h * head_size + i] += att_t *
-            s.value_cache[loff + t * dim + h * head_size + i];
+          xb[i] += att_t * v[i];
         }
       }
     }
@@ -329,8 +398,10 @@ function transformer(
   matmul(s.logits, x, w.wcls, p.dim, p.vocab_size);
 }
 
-function bpe_encode(
+function encode(
   text: string,
+  bos: boolean,
+  eos: boolean,
   vocab: string[],
   vocab_scores: number[],
   vocab_size: number,
@@ -338,6 +409,7 @@ function bpe_encode(
 ) {
   // first encode every individual byte in the input string
   let n_tokens = 0; // the number of tokens
+  if (bos) tokens[n_tokens++] = 1; // BOS token
   for (let i = 0; i < text.length; ++i) {
     let id = vocab.indexOf(text.charAt(i));
     if (id == -1) {
@@ -375,6 +447,8 @@ function bpe_encode(
     n_tokens--; // token length decreased
   }
 
+  if (eos) tokens[n_tokens++] = 1; // EOS token
+
   return n_tokens;
 }
 
@@ -403,56 +477,120 @@ function argmax(arr: Float32Array): number {
   );
 }
 
-function sample(logits: Float32Array, vocabSize: number): number {
-  const sum = logits.reduce((acc, val) => acc + val, 0);
-  const randValue = random_f32() * sum;
-  let cumProb = 0;
-  for (let i = 0; i < vocabSize; i++) {
-    cumProb += logits[i];
-    if (randValue < cumProb) return i;
+function sample(
+  temperature: number,
+  state: RunState,
+  config: Config,
+  topp: number,
+) {
+  // sample the token given the logits and some hyperparameters
+  if (temperature == 0.0) {
+    // greedy argmax sampling: take the token with the highest probability
+    return argmax(state.logits);
+  } else {
+    // apply the temperature to the logits
+    for (let q = 0; q < config.vocab_size; q++) {
+      state.logits[q] /= temperature;
+    }
+    // apply softmax to the logits to get the probabilities for next token
+    softmax(state.logits, config.vocab_size);
+    const coin = random_f32();
+    // we sample from this distribution to get the next token
+    if (topp <= 0 || topp >= 1) {
+      // simply sample from the predicted probability distribution
+      return sample_mult(state.logits, config.vocab_size, coin);
+    } else {
+      // top-p (nucleus) sampling, clamping the least likely tokens to zero
+      return sample_topp(
+        state.logits,
+        config.vocab_size,
+        topp,
+        state.indices,
+        coin,
+      );
+    }
   }
-  return 0;
+}
+
+function sample_mult(
+  logits: Float32Array,
+  n: float,
+  coin: float,
+): number {
+  let cdf = 0;
+  for (let i = 0; i < n; i++) {
+    cdf += logits[i];
+    if (coin < cdf) return i;
+  }
+  return n - 1;
 }
 
 function sample_topp(
-  logits: Float32Array,
+  probabilities: Float32Array,
+  n: float,
   topp: number,
-  probindex: { index: int; prob: float }[],
+  probindex: { prob: float; index: int }[],
+  coin: float,
 ): number {
-  for (let i = 0; i < probindex.length; i++) {
-    probindex[i] = { index: i, prob: logits[i] };
+  // top-p sampling (or "nucleus sampling") samples from the smallest set of
+  // tokens that exceed probability topp. This way we never sample tokens that
+  // have very low probabilities and are less likely to go "off the rails".
+  // coin is a random number in [0, 1), usually from random_f32()
+
+  let n0 = 0;
+  // quicksort indices in descending order of probabilities
+  // values smaller than (1 - topp) / (n - 1) cannot be part of the result
+  // so for efficiency we crop these out as candidates before sorting
+
+  const cutoff = (1.0 - topp) / (n - 1);
+  for (let i = 0; i < n; i++) {
+    if (probabilities[i] >= cutoff) {
+      probindex[n0++] = { index: i, prob: probabilities[i] };
+    }
   }
   probindex.sort((a, b) => b.prob - a.prob);
 
-  let cumProb = 0;
-  let lastIdx = 0;
-  for (let i = 0; i < probindex.length; i++) {
-    cumProb += probindex[i].prob;
-    if (cumProb > topp) {
+  // truncate the list where cumulative probability exceeds topp
+  let cumulativeProb = 0;
+  let lastIdx = n0 - 1; // in case of rounding errors consider all elements
+  for (let i = 0; i < n; i++) {
+    cumulativeProb += probindex[i].prob;
+    if (cumulativeProb > topp) {
       lastIdx = i;
-      break;
+      break; // we've exceeded topp by including last_idx
     }
   }
 
-  const randValue = random_f32() * cumProb;
-  cumProb = 0;
+  // sample from the truncated list
+  const r = coin * cumulativeProb;
+  cumulativeProb = 0;
   for (let i = 0; i < lastIdx; i++) {
-    cumProb += probindex[i].prob;
-    if (randValue < cumProb) return probindex[i].index;
+    cumulativeProb += probindex[i].prob;
+    if (r < cumulativeProb) return probindex[i].index;
   }
-  return 0;
+  return probindex[lastIdx].index;
+}
+
+function decode(vocab: string[], prev_token: number, token: number): string {
+  //console.log("token: %d %d", prev_token, token);
+  let piece = vocab[token];
+  // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
+  if (prev_token == 1 && piece.charAt(0) == " ") piece = piece.substring(1);
+
+  return piece;
 }
 
 // ----------------------------------------------------------------------------
 // int main
 function main() {
   // defaults
-  const [_engine, _script, checkpoint, ...args] = process.argv;
+  //console.log(Deno.args);
+  const [checkpoint, ...args] = Deno.args;
   let temperature = 1.0; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
   let topp = 1.0; // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
   rng_seed = 0n; // seed rng with time by default
   let steps = 256; // max number of steps to run for, 0: use seq_len
-  let prompt = null; // prompt string
+  let prompt: string | null = null; // prompt string
 
   if (!checkpoint) return error_usage();
   for (let i = 0; i < args.length; i += 2) {
@@ -506,7 +644,7 @@ function main() {
   let vocab = new Array<string>(config.vocab_size);
   let vocab_scores = new Array<number>(config.vocab_size);
   let tokBuffer = new BufferReader(fs.readFileSync("tokenizer.bin"));
-  let ignored_max_token_length = tokBuffer.getInt32LE();
+  let _ignored_max_token_length = tokBuffer.getInt32LE();
   for (let i = 0; i < config.vocab_size; i++) {
     vocab_scores[i] = tokBuffer.getFloat32LE();
     vocab[i] = new TextDecoder().decode(
@@ -515,65 +653,57 @@ function main() {
   }
   // create and init the application RunState
   let state = newRunState(config);
-  //debugger;
-  // process the prompt, if any
-  let prompt_tokens: Int32Array = new Int32Array(config.seq_len);
+  if (prompt == null) prompt = "";
+
+  // encode the (string) prompt into tokens sequence
   let num_prompt_tokens = 0;
-  if (prompt != null) {
-    num_prompt_tokens = bpe_encode(
-      prompt,
-      vocab,
-      vocab_scores,
-      config.vocab_size,
-      prompt_tokens,
-    );
-  }
+  let prompt_tokens: Int32Array = new Int32Array(prompt.length + 3); // +3 for '\0', ?BOS, ?EOS
+
+  num_prompt_tokens = encode(
+    prompt,
+    true, // bos
+    false, // no eos
+    vocab,
+    vocab_scores,
+    config.vocab_size,
+    prompt_tokens,
+  );
+  console.log(
+    "Prompt tokens: %d %d %d",
+    prompt_tokens[0],
+    prompt_tokens[1],
+    prompt_tokens[2],
+  );
 
   // start the main loop
   let start = 0; // used to time our code, only initialized after first iteration
   let next; // will store the next token in the sequence
-  let token = 1; // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
+  let token = prompt_tokens[0]; // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
   let pos = 0; // position in the sequence
   while (pos < steps) {
+    //console.log("Step %d", pos + 1);
     // forward the transformer to get logits for the next token
-    transformer(token, pos, config, state, weights);
+    forward(token, pos, config, state, weights);
+
+    //console.log("Step %d decoding", pos + 1);
 
     // advance the state machine
-    if (pos < num_prompt_tokens) {
+    if (pos < num_prompt_tokens - 1) {
       // if we are still processing the input prompt, force the next prompt token
-      next = prompt_tokens[pos];
+      next = prompt_tokens[pos + 1];
     } else {
       // sample the next token
-      if (temperature == 0.0) {
-        // greedy argmax sampling: take the token with the highest probability
-        next = argmax(state.logits);
-      } else {
-        // apply the temperature to the logits
-        for (let q = 0; q < config.vocab_size; q++) {
-          state.logits[q] /= temperature;
-        }
-        // apply softmax to the logits to get the probabilities for next token
-        softmax(state.logits, 0, config.vocab_size);
-        // we sample from this distribution to get the next token
-        if (topp <= 0 || topp >= 1) {
-          // simply sample from the predicted probability distribution
-          next = sample(state.logits, config.vocab_size);
-        } else {
-          // top-p (nucleus) sampling, clamping the least likely tokens to zero
-          next = sample_topp(state.logits, topp, state.indices);
-        }
-      }
+      next = sample(temperature, state, config, topp);
     }
     pos++;
 
     // data-dependent terminating condition: the BOS (1) token delimits sequences
     if (next == 1) break;
 
-    // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR#89)
-    let token_str: string = (token == 1 && vocab[next].charAt(0) == " ")
-      ? vocab[next].substring(1)
-      : vocab[next];
-    process.stdout.write(token_str); // note: assumes utf8 terminal
+    // print the token as string, decode it with the Tokenizer object
+    const piece = decode(vocab, token, next);
+
+    writeAllSync(Deno.stdout, new TextEncoder().encode(piece)); // note: assumes utf8 terminal
     token = next;
 
     // init the timer here because the first iteration can be slower
@@ -600,7 +730,7 @@ function error_usage(): never {
     "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len",
   );
   console.error("  -i <string> input prompt");
-  process.exit(1);
+  Deno.exit(1);
 }
 
 main();
