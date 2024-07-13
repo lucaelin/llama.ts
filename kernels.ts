@@ -50,13 +50,11 @@ export function matmul(
   for (let i = 0; i < d; i++) {
     let sum = 0;
     for (let j = 0; j < n; j++) {
-      if (i * n + j >= w.length) {
-        throw new Error("matmul weights out of bounds");
-      }
-      if (j >= x.length) throw new Error("matmul activations out of bounds");
+      //if (i * n + j >= w.length) throw new Error("matmul weights out of bounds");
+      //if (j >= x.length) throw new Error("matmul activations out of bounds");
       sum += w[i * n + j] * x[j];
     }
-    if (i >= o.length) throw new Error("matmul output out of bounds");
+    //if (i >= o.length) throw new Error("matmul output out of bounds");
     o[i] = sum;
   }
 }

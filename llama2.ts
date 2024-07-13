@@ -244,11 +244,18 @@ function forward(
     //console.log("Attention output");
     matmul(s.xb2, s.xb, w.o_proj[l], p.dim, p.dim);
     if (pa && sa && wa) {
-      if (wa.o_proj_a) {
-        matmul(sa.o_r, s.xb, wa.o_proj_a[l], p.dim, pa.rank);
-      }
-      if (wa.o_proj_b) {
-        matmuladd(s.xb2, sa.o_r, wa.o_proj_b[l], pa.rank, p.dim, adapter_scale);
+      if (wa.o_proj_a && wa.o_proj_b) {
+        lora(
+          s.xb2,
+          s.xb,
+          sa.o_r,
+          wa.o_proj_a[l],
+          wa.o_proj_b[l],
+          p.dim,
+          p.dim,
+          pa.rank,
+          adapter_scale,
+        );
       }
     }
 
@@ -597,9 +604,10 @@ function main() {
   set_seed(rng_seed || Date.now());
 
   console.log('Loading model from "%s"...', checkpoint);
-  const { config: hfConfig, weights: hfWeights } = readHFRepo<Float32Array>(
+  const { config: hfConfig, weights: hfWeights } = readHFRepo(
     checkpoint + "/config.json",
     checkpoint + "/model.safetensors",
+    "F32",
   );
   const { config, weights } = readModel(hfConfig, hfWeights);
 
@@ -607,11 +615,10 @@ function main() {
   let adapterWeights;
   if (adapter) {
     console.log('Loading adapter from "%s"...', adapter);
-    const { config: hfAdapterConfig, weights: hfAdapterWeights } = readHFRepo<
-      Float32Array
-    >(
+    const { config: hfAdapterConfig, weights: hfAdapterWeights } = readHFRepo(
       adapter + "/adapter_config.json",
       adapter + "/adapter_model.safetensors",
+      "F32",
     );
     const model = readAdapter(
       hfConfig,
