@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { Buffer } from "node:buffer";
 
 function raise(message: string): never {
@@ -26,20 +27,20 @@ type HeaderEntry = {
 type Header = {
   [key: string]: HeaderEntry;
 } & {
-  __metadata__: { [key: string]: string } & {
+  __metadata__: { [key: string]: string | number } & {
     format: "pt" | string;
     headerLength: number;
   };
 };
 
-type WeightsEntry = HeaderEntry & { weights: ArrayBuffer };
-interface RecursiveWeights {
-  [key: string]: Weights;
+type WeightsEntry<D extends ArrayBufferLike> = HeaderEntry & { weights: D };
+interface RecursiveWeights<D extends ArrayBufferLike> {
+  [key: string]: Weights<D>;
 }
-type Weights =
-  & RecursiveWeights
-  & { weight: WeightsEntry }
-  & { layers: RecursiveWeights[] };
+type Weights<D extends ArrayBufferLike> =
+  & RecursiveWeights<D>
+  & { weight: WeightsEntry<D> }
+  & { layers: RecursiveWeights<D>[] };
 
 function readSTHeader(handle: FileHandle): Header {
   const prefixBytes = new Uint8Array(8);
@@ -67,7 +68,7 @@ function readSTWeights(
   handle: FileHandle,
   headerSize: number,
   entry: HeaderEntry,
-): ArrayBuffer {
+): ArrayBufferLike {
   const dtype = {
     F64: Float64Array,
     F32: Float32Array,
@@ -97,17 +98,17 @@ function readSTWeights(
     data.buffer,
     data.byteOffset,
     data.length / dtype.BYTES_PER_ELEMENT,
-  );
+  ).buffer;
 }
 
-function readSafetensors(path: string) {
+function readSafetensors<D extends ArrayBufferLike>(path: string) {
   const handle = fs.openSync(path, "r") as FileHandle;
   const header = readSTHeader(handle);
 
-  const weights: RecursiveWeights = {};
+  const weights: RecursiveWeights<D> = {};
 
   for (const [key, value] of Object.entries(header)) {
-    // console.log("reading", key, value.shape);
+    console.log("reading", key, value.shape);
     if (key === "__metadata__") {
       continue;
     }
@@ -116,13 +117,14 @@ function readSafetensors(path: string) {
       header.__metadata__.headerLength,
       value as HeaderEntry,
     );
+
     const path = key.split(".");
-    let current: Weights = weights as Weights;
+    let current: Weights<D> = weights as Weights<D>;
     for (let i = 0; i < path.length - 1; i++) {
       if (!current[path[i]]) {
         current[path[i]] = path[i] === "layers" ? ([] as any) : {};
       }
-      current = current[path[i]] as Weights;
+      current = current[path[i]] as Weights<D>;
     }
     current[path[path.length - 1]] = {
       ...(value as HeaderEntry),
@@ -136,19 +138,80 @@ function readSafetensors(path: string) {
   };
 }
 
-export type TransformersModel = {
-  config: Record<string, any>;
+function readSafetensorsIndex<D extends ArrayBufferLike>(indexFile: string) {
+  const index: {
+    metadata: Record<string, unknown>;
+    weight_map: Record<string, string>;
+  } = JSON.parse(fs.readFileSync(indexFile, { encoding: "utf-8" }));
+  const files = Object.values(index.weight_map).filter((f, i, a) =>
+    a.indexOf(f) === i
+  );
+
+  let metadata = index.metadata;
+  const weights: RecursiveWeights<D> = {};
+  for (const file of files) {
+    const filePath = path.dirname(indexFile) + "/" + file;
+
+    const handle = fs.openSync(filePath, "r") as FileHandle;
+    const header = readSTHeader(handle);
+
+    for (const [key, value] of Object.entries(header)) {
+      console.log("reading", key, value.shape);
+      if (key === "__metadata__") {
+        metadata = { ...metadata, ...value };
+        continue;
+      }
+      const data = readSTWeights(
+        handle,
+        header.__metadata__.headerLength,
+        value as HeaderEntry,
+      );
+
+      const path = key.split(".");
+      let current: Weights<D> = weights as Weights<D>;
+      for (let i = 0; i < path.length - 1; i++) {
+        if (!current[path[i]]) {
+          current[path[i]] = path[i] === "layers" ? ([] as any) : {};
+        }
+        current = current[path[i]] as Weights<D>;
+      }
+      current[path[path.length - 1]] = {
+        ...(value as HeaderEntry),
+        weights: data,
+      } as any;
+    }
+  }
+  return {
+    metadata: metadata,
+    weights,
+  };
+}
+
+export type TransformersModel<D extends ArrayBufferLike> = {
+  config: Record<string, unknown>;
   metadata: Record<string, string>;
-  weights: RecursiveWeights;
+  weights: RecursiveWeights<D>;
 };
 
-export function readHFRepo(configPath: string, modelPath: string) {
+export function readHFRepo<D extends ArrayBufferLike>(
+  configPath: string,
+  modelPath: string,
+) {
   const config = JSON.parse(fs.readFileSync(configPath, { encoding: "utf-8" }));
+  const indexFile = modelPath.endsWith(".index.json")
+    ? modelPath
+    : fs.existsSync(modelPath + ".index.json")
+    ? modelPath + ".index.json"
+    : "";
+  if (indexFile) {
+    const model = readSafetensorsIndex(indexFile);
+    return { config, ...model } as TransformersModel<D>;
+  }
   const model = readSafetensors(modelPath) as {
     metadata: Record<string, string>;
-    weights: RecursiveWeights;
+    weights: RecursiveWeights<D>;
   };
-  return { config, ...model } as TransformersModel;
+  return { config, ...model } as TransformersModel<D>;
 }
 
 /*

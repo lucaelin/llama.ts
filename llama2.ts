@@ -11,6 +11,11 @@ import {
   readHFRepo,
   TransformersModel,
 } from "./safetensors.ts";
+import { accum, elemmul, matmul, matmuladd, rmsnorm, silu } from "./kernels.ts";
+import { lora, mutlihead_attention, rope } from "./transformer.ts";
+import { decode, encode } from "./sentencepiece.ts";
+import { sample } from "./sampler.ts";
+import { set_seed } from "./rng.ts";
 
 // ----------------------------------------------------------------------------
 // binary utils
@@ -32,18 +37,18 @@ interface Config {
 }
 
 interface TransformerWeights {
-  token_embedding_table: Float32Array;
-  rms_att_weight: Float32Array[];
-  wq: Float32Array[];
-  wk: Float32Array[];
-  wv: Float32Array[];
-  wo: Float32Array[];
-  rms_ffn_weight: Float32Array[];
-  w1: Float32Array[];
-  w2: Float32Array[];
-  w3: Float32Array[];
-  rms_final_weight: Float32Array;
-  wcls: Float32Array;
+  embed_tokens: Float32Array;
+  input_layernorm: Float32Array[];
+  q_proj: Float32Array[];
+  k_proj: Float32Array[];
+  v_proj: Float32Array[];
+  o_proj: Float32Array[];
+  post_attention_layernorm: Float32Array[];
+  gate_proj: Float32Array[];
+  down_proj: Float32Array[];
+  up_proj: Float32Array[];
+  norm: Float32Array;
+  lm_head: Float32Array;
 }
 
 interface AdapterConfig {
@@ -69,7 +74,6 @@ interface AdapterWeights {
 }
 
 interface RunState {
-  // current wave of activations
   x: Float32Array;
   xb: Float32Array;
   xb2: Float32Array;
@@ -78,11 +82,10 @@ interface RunState {
   q: Float32Array;
   k: Float32Array;
   v: Float32Array;
-  att: Float32Array; // buffer for scores/attention values (n_heads, seq_len)
+  att: Float32Array;
   logits: Float32Array;
   key_cache: Float32Array;
   value_cache: Float32Array;
-  indices: { prob: float; index: int }[];
 }
 
 interface AdapterRunState {
@@ -97,7 +100,6 @@ interface AdapterRunState {
 function newRunState(config: Config): RunState {
   const kv_dim = (config.dim * config.n_kv_heads) / config.n_heads;
   const s = {} as RunState;
-  s.indices = new Array(config.vocab_size);
   s.x = new Float32Array(config.dim);
   s.xb = new Float32Array(config.dim);
   s.xb2 = new Float32Array(config.dim);
@@ -126,89 +128,6 @@ function newAdapterState(config: AdapterConfig): AdapterRunState {
   return s;
 }
 
-// ----------------------------------------------------------------------------
-// neural net blocks
-
-function accum(a: Float32Array, b: Float32Array, size: number): void {
-  for (let i = 0; i < size; i++) a[i] += b[i];
-}
-
-function rmsnorm(
-  o: Float32Array,
-  x: Float32Array,
-  weight: Float32Array,
-  size: number,
-): void {
-  let ss = 0;
-  for (let j = 0; j < size; j++) ss += x[j] * x[j];
-  ss /= size;
-  ss = 1.0 / Math.sqrt(1e-5 + ss);
-  for (let j = 0; j < size; j++) o[j] = weight[j] * (ss * x[j]);
-  // debugger;
-}
-
-function softmax(x: Float32Array, size: number): void {
-  // find max value (for numerical stability)
-  let max_val = x[0];
-  for (let i = 1; i < size; i++) {
-    if (x[i] > max_val) max_val = x[i];
-  }
-
-  // exp and sum
-  let sum = 0;
-  for (let i = 0; i < size; i++) {
-    x[i] = Math.exp(x[i] - max_val);
-    sum += x[i];
-  }
-
-  // normalize
-  for (let i = 0; i < size; i++) {
-    x[i] /= sum; //Accumulator[0]; // ah forget it, it's numerically stable enough
-  }
-}
-
-function matmul(
-  xout: Float32Array,
-  x: Float32Array,
-  w: Float32Array,
-  n: number,
-  d: number,
-): void {
-  // W (d, n) @ x (n,) -> xout (d,)
-  for (let i = 0; i < d; i++) {
-    let sum = 0;
-    for (let j = 0; j < n; j++) {
-      if (i * n + j >= w.length) {
-        throw new Error("matmul weights out of bounds");
-      }
-      if (j >= x.length) throw new Error("matmul activations out of bounds");
-      sum += w[i * n + j] * x[j];
-    }
-    if (i >= xout.length) throw new Error("matmul output out of bounds");
-    xout[i] = sum; //sumAccumulator[0];
-  }
-}
-function matmuladd(
-  xout: Float32Array,
-  x: Float32Array,
-  w: Float32Array,
-  n: number,
-  d: number,
-  scale: number = 1.0,
-): void {
-  // W (d, n) @ x (n,) -> xout (d,)
-  for (let i = 0; i < d; i++) {
-    let sum = 0;
-    for (let j = 0; j < n; j++) {
-      //if (i * n + j >= w.length) throw new Error("matmul weights out of bounds");
-      //if (j >= x.length) throw new Error("matmul activations out of bounds");
-      sum += w[i * n + j] * x[j];
-    }
-    //if (i >= xout.length) throw new Error("matmul output out of bounds");
-    xout[i] += sum * scale; //sumAccumulator[0];
-  }
-}
-
 function forward(
   token: number,
   pos: number,
@@ -219,393 +138,193 @@ function forward(
   sa?: AdapterRunState,
   wa?: AdapterWeights,
 ): void {
-  const x = s.x;
-  const dim = p.dim;
   const kv_dim = (p.dim * p.n_kv_heads) / p.n_heads;
-  const kv_mul = p.n_heads / p.n_kv_heads; // integer multiplier of the kv sharing in multiquery
 
   const hidden_dim = p.hidden_dim;
-  const head_size = dim / p.n_heads;
+  const head_size = p.dim / p.n_heads;
 
   const adapter_scale = pa ? pa.rank / pa.alpha : 0;
 
   // copy the token embedding into x
-  x.set(w.token_embedding_table.subarray(token * dim, token * dim + dim));
+  s.x.set(
+    w.embed_tokens.subarray(token * p.dim, token * p.dim + p.dim),
+  );
 
   //debugger;
   // forward all the layers
   for (let l = 0; l < p.n_layers; l++) {
     //console.log("Layer %d", l + 1);
     // attention rmsnorm
-    rmsnorm(s.xb, x, w.rms_att_weight[l], dim);
+    rmsnorm(s.xb, s.x, w.input_layernorm[l], p.dim);
 
     // key and value point to the kv cache
-    const loff = l * p.seq_len * kv_dim; // kv cache layer offset for convenience
+    const kv_cache_layer_offset = l * p.seq_len * kv_dim; // kv cache layer offset for convenience
+    const kv_cache_layer_pos_offset = kv_cache_layer_offset + pos * kv_dim; // kv cache layer pos offset for convenience
     s.k = s.key_cache.subarray(
-      loff + pos * kv_dim,
-      loff + pos * kv_dim + kv_dim,
+      kv_cache_layer_pos_offset,
+      kv_cache_layer_pos_offset + kv_dim,
     );
     s.v = s.value_cache.subarray(
-      loff + pos * kv_dim,
-      loff + pos * kv_dim + kv_dim,
+      kv_cache_layer_pos_offset,
+      kv_cache_layer_pos_offset + kv_dim,
     );
 
     // qkv matmuls for this position
     //console.log("QKV matmuls");
-    matmul(s.q, s.xb, w.wq[l], dim, dim);
-    matmul(s.k, s.xb, w.wk[l], dim, kv_dim);
-    matmul(s.v, s.xb, w.wv[l], dim, kv_dim);
+    matmul(s.q, s.xb, w.q_proj[l], p.dim, p.dim);
+    matmul(s.k, s.xb, w.k_proj[l], p.dim, kv_dim);
+    matmul(s.v, s.xb, w.v_proj[l], p.dim, kv_dim);
 
     // LoRA adapter
     if (pa && sa && wa) {
       //console.log("LoRA matmuls");
-      if (wa.q_proj_a) {
-        matmul(sa.q_r, s.xb, wa.q_proj_a[l], dim, pa.rank);
-      }
-      if (wa.k_proj_a) {
-        matmul(sa.k_r, s.xb, wa.k_proj_a[l], dim, pa.rank);
-      }
-      if (wa.v_proj_a) {
-        matmul(sa.v_r, s.xb, wa.v_proj_a[l], kv_dim, pa.rank);
-      }
-      if (wa.q_proj_b) {
-        matmuladd(s.q, sa.q_r, wa.q_proj_b[l], pa.rank, dim, adapter_scale);
-      }
-      if (wa.k_proj_b) {
-        matmuladd(s.k, sa.k_r, wa.k_proj_b[l], pa.rank, kv_dim, adapter_scale);
-      }
-      if (wa.v_proj_b) {
-        matmuladd(s.v, sa.v_r, wa.v_proj_b[l], pa.rank, kv_dim, adapter_scale);
-      }
-    }
-
-    // RoPE relative positional encoding: complex-valued rotate q and k by freq_cis in each head
-    //console.log('RoPE');
-    for (let i = 0; i < dim; i += 2) {
-      const head_dim = i % head_size;
-      const freq = 1.0 / Math.pow(p.rope_theta, head_dim / head_size);
-      const val = pos * freq;
-      const fcr = Math.cos(val);
-      const fci = Math.sin(val);
-
-      if (i < kv_dim) {
-        const v0 = s.k[i];
-        const v1 = s.k[i + 1];
-        s.k[i] = v0 * fcr - v1 * fci;
-        s.k[i + 1] = v0 * fci + v1 * fcr;
-      }
-
-      const v0 = s.q[i];
-      const v1 = s.q[i + 1];
-      s.q[i] = v0 * fcr - v1 * fci;
-      s.q[i + 1] = v0 * fci + v1 * fcr;
-    }
-
-    //console.log("Multi-Headed Attention");
-    for (let h = 0; h < p.n_heads; h++) {
-      let q = s.q.subarray(h * head_size, h * head_size + head_size);
-      let att = s.att.subarray(h * p.seq_len, h * p.seq_len + p.seq_len);
-
-      // iterate over all timesteps, including the current one
-      for (let t = 0; t <= pos; t++) {
-        // get the key vector for this head and at this timestep
-        const k = s.key_cache.subarray(
-          loff + t * kv_dim + Math.floor(h / kv_mul) * head_size,
-          loff + t * kv_dim + Math.floor(h / kv_mul) * head_size + head_size,
+      if (wa.q_proj_a && wa.q_proj_b) {
+        lora(
+          s.q,
+          s.xb,
+          sa.q_r,
+          wa.q_proj_a[l],
+          wa.q_proj_b[l],
+          p.dim,
+          p.dim,
+          pa.rank,
+          adapter_scale,
         );
-        // calculate the attention score as the dot product of q and k
-        let score = 0.0;
-        for (let i = 0; i < head_size; i++) score += q[i] * k[i];
-        // save the score to the attention buffer
-        att[t] = score / Math.sqrt(head_size);
       }
-
-      softmax(att, pos + 1);
-
-      // weighted sum of the values, store back into xb
-      const xb = s.xb.subarray(h * head_size, h * head_size + head_size);
-      xb.fill(0, 0, head_size);
-      for (let t = 0; t <= pos; t++) {
-        const v = s.value_cache.subarray(
-          loff + t * kv_dim + Math.floor(h / kv_mul) * head_size,
-          loff + t * kv_dim + Math.floor(h / kv_mul) * head_size + head_size,
+      if (wa.k_proj_a && wa.k_proj_b) {
+        lora(
+          s.k,
+          s.xb,
+          sa.k_r,
+          wa.k_proj_a[l],
+          wa.k_proj_b[l],
+          p.dim,
+          kv_dim,
+          pa.rank,
+          adapter_scale,
         );
-        const att_t = att[t];
-        for (let i = 0; i < head_size; i++) {
-          xb[i] += att_t * v[i];
-        }
+      }
+      if (wa.v_proj_a && wa.v_proj_b) {
+        lora(
+          s.v,
+          s.xb,
+          sa.v_r,
+          wa.v_proj_a[l],
+          wa.v_proj_b[l],
+          p.dim,
+          kv_dim,
+          pa.rank,
+          adapter_scale,
+        );
       }
     }
+
+    rope(s.q, s.k, pos, p.dim, kv_dim, head_size, p.rope_theta);
+
+    mutlihead_attention(
+      s.xb,
+      s.q,
+      s.key_cache.subarray(
+        kv_cache_layer_offset,
+        kv_cache_layer_offset + p.seq_len * kv_dim,
+      ),
+      s.value_cache.subarray(
+        kv_cache_layer_offset,
+        kv_cache_layer_offset + p.seq_len * kv_dim,
+      ),
+      s.att,
+      pos,
+      p.seq_len,
+      p.dim,
+      p.n_heads,
+      p.n_kv_heads,
+    );
 
     // final matmul to get the output of the attention
     //console.log("Attention output");
-    matmul(s.xb2, s.xb, w.wo[l], dim, dim);
+    matmul(s.xb2, s.xb, w.o_proj[l], p.dim, p.dim);
     if (pa && sa && wa) {
       if (wa.o_proj_a) {
-        matmul(sa.o_r, s.xb, wa.o_proj_a[l], dim, pa.rank);
+        matmul(sa.o_r, s.xb, wa.o_proj_a[l], p.dim, pa.rank);
       }
       if (wa.o_proj_b) {
-        matmuladd(s.xb2, sa.o_r, wa.o_proj_b[l], pa.rank, dim, adapter_scale);
+        matmuladd(s.xb2, sa.o_r, wa.o_proj_b[l], pa.rank, p.dim, adapter_scale);
       }
     }
 
     //console.log("Residual connections");
-    accum(x, s.xb2, dim);
+    accum(s.x, s.xb2, p.dim);
 
     //console.log("FFN rmsnorm");
-    rmsnorm(s.xb, x, w.rms_ffn_weight[l], dim);
+    rmsnorm(s.xb, s.x, w.post_attention_layernorm[l], p.dim);
 
     //console.log("FFN Gate + Up");
     // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
     // first calculate self.w1(x) and self.w3(x)
-    matmul(s.hb, s.xb, w.w1[l], dim, hidden_dim);
-    matmul(s.hb2, s.xb, w.w3[l], dim, hidden_dim);
+    matmul(s.hb, s.xb, w.gate_proj[l], p.dim, hidden_dim);
+    matmul(s.hb2, s.xb, w.up_proj[l], p.dim, hidden_dim);
     if (pa && sa && wa) {
-      if (wa.gate_proj_a) {
-        matmul(sa.gate_r, s.xb, wa.gate_proj_a[l], dim, pa.rank);
-      }
-      if (wa.up_proj_a) {
-        matmul(sa.up_r, s.xb, wa.up_proj_a[l], dim, pa.rank);
-      }
-      if (wa.gate_proj_b) {
-        matmuladd(
+      if (wa.gate_proj_a && wa.gate_proj_b) {
+        lora(
           s.hb,
+          s.xb,
           sa.gate_r,
+          wa.gate_proj_a[l],
           wa.gate_proj_b[l],
-          pa.rank,
+          p.dim,
           hidden_dim,
+          pa.rank,
           adapter_scale,
         );
       }
-      if (wa.up_proj_b) {
-        matmuladd(
+      if (wa.up_proj_a && wa.up_proj_b) {
+        lora(
           s.hb2,
+          s.xb,
           sa.up_r,
+          wa.up_proj_a[l],
           wa.up_proj_b[l],
-          pa.rank,
+          p.dim,
           hidden_dim,
+          pa.rank,
           adapter_scale,
         );
       }
     }
 
-    // F.silu; silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-    for (let i = 0; i < hidden_dim; i++) {
-      s.hb[i] = s.hb[i] * (1.0 / (1.0 + Math.exp(-s.hb[i])));
-    }
+    silu(s.hb, hidden_dim);
 
     // elementwise multiply with w3(x)
-    for (let i = 0; i < hidden_dim; i++) s.hb[i] = s.hb[i] * s.hb2[i];
+    elemmul(s.hb, s.hb2, hidden_dim);
 
     //console.log("FFN Final output");
     // final matmul to get the output of the ffn
-    matmul(s.xb, s.hb, w.w2[l], hidden_dim, dim);
+    matmul(s.xb, s.hb, w.down_proj[l], hidden_dim, p.dim);
     if (pa && sa && wa) {
-      if (wa.down_proj_a) {
-        matmul(sa.down_r, s.hb, wa.down_proj_a[l], hidden_dim, pa.rank);
-      }
-      if (wa.down_proj_b) {
-        matmuladd(
+      if (wa.down_proj_a && wa.down_proj_b) {
+        lora(
           s.xb,
+          s.hb,
           sa.down_r,
+          wa.down_proj_a[l],
           wa.down_proj_b[l],
+          hidden_dim,
+          p.dim,
           pa.rank,
-          dim,
           adapter_scale,
         );
       }
     }
 
     //console.log("Residual connections");
-    accum(x, s.xb, dim);
+    accum(s.x, s.xb, p.dim);
   }
 
   // final rmsnorm
-  rmsnorm(x, x, w.rms_final_weight, dim);
+  rmsnorm(s.x, s.x, w.norm, p.dim);
 
   // classifier into logits
-  matmul(s.logits, x, w.wcls, p.dim, p.vocab_size);
-}
-
-function encode(
-  text: string,
-  bos: boolean,
-  eos: boolean,
-  vocab: string[],
-  vocab_scores: number[],
-  tokens: Int32Array,
-) {
-  // first encode every individual byte in the input string
-  let n_tokens = 0; // the number of tokens
-  if (bos) tokens[n_tokens++] = 1; // BOS token
-  for (let i = 0; i < text.length; ++i) {
-    let id = vocab.indexOf(text.charAt(i));
-    if (id == -1) {
-      throw new Error("Error: character not found in vocab: " + text.charAt(i));
-    }
-    tokens[n_tokens++] = id;
-  }
-
-  // merge the best consecutive pair each iteration, according the scores in vocab_scores
-  while (true) {
-    let best_score = -1e10;
-    let best_id = -1;
-    let best_idx = -1;
-
-    for (let i = 0; i < n_tokens - 1; ++i) {
-      // check if we can merge the pair (tokens[i], tokens[i+1])
-      let str_buffer = vocab[tokens[i]] + vocab[tokens[i + 1]];
-      let id = vocab.indexOf(str_buffer);
-      if (id != -1 && vocab_scores[id] > best_score) {
-        // this merge pair exists in vocab! record its score and position
-        best_score = vocab_scores[id];
-        best_id = id;
-        best_idx = i;
-      }
-    }
-
-    if (best_idx == -1) break; // we couldn't find any more pairs to merge, so we're done
-
-    // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
-    tokens[best_idx] = best_id;
-    // delete token at position best_idx+1, shift the entire sequence back 1
-    for (let i = best_idx + 1; i < n_tokens - 1; i++) {
-      tokens[i] = tokens[i + 1];
-    }
-    n_tokens--; // token length decreased
-  }
-
-  if (eos) tokens[n_tokens++] = 1; // EOS token
-
-  return n_tokens;
-}
-
-// ----------------------------------------------------------------------------
-// utilities: time / rng
-let rng_seed: bigint = 0n;
-function random_u32(): number {
-  rng_seed ^= rng_seed >> 12n;
-  rng_seed ^= (rng_seed << 25n) & 0xffffffffffffffffn;
-  rng_seed ^= rng_seed >> 27n;
-  return Number(((rng_seed * 0x2545F4914F6CDD1Dn) >> 32n) & 0xffffffffn);
-}
-
-const floatCaster = new Float32Array(1);
-function random_f32() { // random float32 in [0,1)
-  floatCaster[0] = (random_u32() / 256) / 16777216.0;
-  return floatCaster[0]; // force f32
-}
-
-// ----------------------------------------------------------------------------
-// sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
-function argmax(arr: Float32Array): number {
-  return arr.reduce(
-    (maxIdx, val, idx, array) => (val > array[maxIdx] ? idx : maxIdx),
-    0,
-  );
-}
-
-function sample(
-  temperature: number,
-  state: RunState,
-  config: Config,
-  topp: number,
-) {
-  // sample the token given the logits and some hyperparameters
-  if (temperature == 0.0) {
-    // greedy argmax sampling: take the token with the highest probability
-    return argmax(state.logits);
-  } else {
-    // apply the temperature to the logits
-    for (let q = 0; q < config.vocab_size; q++) {
-      state.logits[q] /= temperature;
-    }
-    // apply softmax to the logits to get the probabilities for next token
-    softmax(state.logits, config.vocab_size);
-    const coin = random_f32();
-    // we sample from this distribution to get the next token
-    if (topp <= 0 || topp >= 1) {
-      // simply sample from the predicted probability distribution
-      return sample_mult(state.logits, config.vocab_size, coin);
-    } else {
-      // top-p (nucleus) sampling, clamping the least likely tokens to zero
-      return sample_topp(
-        state.logits,
-        config.vocab_size,
-        topp,
-        state.indices,
-        coin,
-      );
-    }
-  }
-}
-
-function sample_mult(
-  logits: Float32Array,
-  n: float,
-  coin: float,
-): number {
-  let cdf = 0;
-  for (let i = 0; i < n; i++) {
-    cdf += logits[i];
-    if (coin < cdf) return i;
-  }
-  return n - 1;
-}
-
-function sample_topp(
-  probabilities: Float32Array,
-  n: float,
-  topp: number,
-  probindex: { prob: float; index: int }[],
-  coin: float,
-): number {
-  // top-p sampling (or "nucleus sampling") samples from the smallest set of
-  // tokens that exceed probability topp. This way we never sample tokens that
-  // have very low probabilities and are less likely to go "off the rails".
-  // coin is a random number in [0, 1), usually from random_f32()
-
-  let n0 = 0;
-  // quicksort indices in descending order of probabilities
-  // values smaller than (1 - topp) / (n - 1) cannot be part of the result
-  // so for efficiency we crop these out as candidates before sorting
-
-  const cutoff = (1.0 - topp) / (n - 1);
-  for (let i = 0; i < n; i++) {
-    if (probabilities[i] >= cutoff) {
-      probindex[n0++] = { index: i, prob: probabilities[i] };
-    }
-  }
-  probindex.sort((a, b) => b.prob - a.prob);
-
-  // truncate the list where cumulative probability exceeds topp
-  let cumulativeProb = 0;
-  let lastIdx = n0 - 1; // in case of rounding errors consider all elements
-  for (let i = 0; i < n; i++) {
-    cumulativeProb += probindex[i].prob;
-    if (cumulativeProb > topp) {
-      lastIdx = i;
-      break; // we've exceeded topp by including last_idx
-    }
-  }
-
-  // sample from the truncated list
-  const r = coin * cumulativeProb;
-  cumulativeProb = 0;
-  for (let i = 0; i < lastIdx; i++) {
-    cumulativeProb += probindex[i].prob;
-    if (r < cumulativeProb) return probindex[i].index;
-  }
-  return probindex[lastIdx].index;
-}
-
-function decode(vocab: string[], prev_token: number, token: number): string {
-  //console.log("token: %d %d", prev_token, token);
-  let piece = vocab[token];
-  // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
-  if (prev_token == 1 && piece.charAt(0) == " ") piece = piece.substring(1);
-
-  return piece;
+  matmul(s.logits, s.x, w.lm_head, p.dim, p.vocab_size);
 }
 
 function readTokenizer(tokenizerPath: string, vocab_size: number) {
@@ -615,7 +334,7 @@ function readTokenizer(tokenizerPath: string, vocab_size: number) {
   let tokBufferOffset = 0;
   let _ignored_max_token_length = tokBuffer.readInt32LE(tokBufferOffset);
   tokBufferOffset += 4;
-  for (let i = 0; i < vocab_size; i++) {
+  for (let i = 0; i < Math.min(vocab_size, 32000); i++) { // TODO vocab_size is limited to 32000
     vocab_scores[i] = tokBuffer.readFloatLE(tokBufferOffset);
     tokBufferOffset += 4;
 
@@ -635,170 +354,197 @@ function readTokenizer(tokenizerPath: string, vocab_size: number) {
 }
 
 function readModel(
-  hfConfig: TransformersModel["config"],
-  hfWeights: TransformersModel["weights"],
+  hfConfig: TransformersModel<Float32Array>["config"],
+  hfWeights: TransformersModel<Float32Array>["weights"],
 ) {
   const config: Config = {
-    dim: hfConfig.hidden_size,
-    hidden_dim: hfConfig.intermediate_size,
-    head_size: hfConfig.hidden_size / hfConfig.num_attention_heads,
-    n_heads: hfConfig.num_attention_heads,
-    n_kv_heads: hfConfig.num_key_value_heads,
-    n_layers: hfConfig.num_hidden_layers,
-    seq_len: hfConfig.max_position_embeddings,
-    vocab_size: hfConfig.vocab_size,
-    rope_theta: hfConfig.rope_theta,
-    norm_eps: hfConfig.rms_norm_eps,
+    dim: hfConfig.hidden_size as number,
+    hidden_dim: hfConfig.intermediate_size as number,
+    head_size: hfConfig.hidden_size as number /
+      (hfConfig.num_attention_heads as number),
+    n_heads: hfConfig.num_attention_heads as number,
+    n_kv_heads: hfConfig.num_key_value_heads as number,
+    n_layers: hfConfig.num_hidden_layers as number,
+    seq_len: hfConfig.max_position_embeddings as number,
+    vocab_size: 32000, // hfConfig.vocab_size as number,
+    rope_theta: hfConfig.rope_theta as number,
+    norm_eps: hfConfig.rms_norm_eps as number,
   };
 
   const weights: TransformerWeights = {
-    token_embedding_table: new Float32Array(
-      hfWeights.model.embed_tokens.weight.weights,
+    embed_tokens: hfWeights.model.embed_tokens.weight.weights,
+    input_layernorm: hfWeights.model.layers.map((l) =>
+      l.input_layernorm.weight.weights
     ),
-    rms_att_weight: hfWeights.model.layers.map((l) =>
-      new Float32Array(l.input_layernorm.weight.weights)
-    ),
-    wq: hfWeights.model.layers.map((l) =>
+    q_proj: hfWeights.model.layers.map((l) =>
       permuteReverse(
-        new Float32Array(l.self_attn.q_proj.weight.weights),
+        l.self_attn.q_proj?.weight.weights ??
+          l.self_attn.qkv_proj.weight.weights.slice(
+            0,
+            config.dim * config.dim,
+          ),
         config.n_heads,
         config.dim,
         config.dim,
       )
     ),
-    wk: hfWeights.model.layers.map((l) =>
+    k_proj: hfWeights.model.layers.map((l) =>
       permuteReverse(
-        new Float32Array(l.self_attn.k_proj.weight.weights),
+        l.self_attn.k_proj?.weight.weights ??
+          l.self_attn.qkv_proj.weight.weights.slice(
+            config.dim * config.dim,
+            config.dim * config.dim +
+              config.dim *
+                (Math.floor(config.dim / config.n_heads) * config.n_kv_heads),
+          ),
         config.n_kv_heads,
         Math.floor(config.dim / config.n_heads) * config.n_kv_heads,
         config.dim,
       )
     ),
-    wv: hfWeights.model.layers.map((l) =>
-      new Float32Array(l.self_attn.v_proj.weight.weights)
+    v_proj: hfWeights.model.layers.map((l) =>
+      l.self_attn.v_proj?.weight.weights ??
+        l.self_attn.qkv_proj.weight.weights.slice(
+          config.dim * config.dim +
+            config.dim *
+              (Math.floor(config.dim / config.n_heads) * config.n_kv_heads),
+          config.dim * config.dim +
+            config.dim *
+              (Math.floor(config.dim / config.n_heads) * config.n_kv_heads) * 2,
+        )
     ),
-    wo: hfWeights.model.layers.map((l) =>
-      new Float32Array(l.self_attn.o_proj.weight.weights)
+    o_proj: hfWeights.model.layers.map((l) =>
+      l.self_attn.o_proj.weight.weights
     ),
-    rms_ffn_weight: hfWeights.model.layers.map((l) =>
-      new Float32Array(l.post_attention_layernorm.weight.weights)
+    post_attention_layernorm: hfWeights.model.layers.map((l) =>
+      l.post_attention_layernorm.weight.weights
     ),
-    w1: hfWeights.model.layers.map((l) =>
-      new Float32Array(l.mlp.gate_proj.weight.weights)
+    gate_proj: hfWeights.model.layers.map((l) =>
+      l.mlp.gate_proj?.weight.weights ??
+        l.mlp.gate_up_proj?.weight?.weights.slice(
+          0,
+          config.hidden_dim * config.dim,
+        )
     ),
-    w2: hfWeights.model.layers.map((l) =>
-      new Float32Array(l.mlp.down_proj.weight.weights)
+    down_proj: hfWeights.model.layers.map((l) =>
+      l.mlp.down_proj.weight.weights
     ),
-    w3: hfWeights.model.layers.map((l) =>
-      new Float32Array(l.mlp.up_proj.weight.weights)
+    up_proj: hfWeights.model.layers.map((l) =>
+      l.mlp.up_proj?.weight?.weights ??
+        l.mlp.gate_up_proj?.weight.weights.slice(
+          config.hidden_dim * config.dim,
+          2 * config.hidden_dim * config.dim,
+        )
     ),
-    rms_final_weight: new Float32Array(hfWeights.model.norm.weight.weights),
-    wcls: new Float32Array(
-      hfWeights.lm_head?.weight?.weights ??
-        hfWeights.model.embed_tokens.weight.weights,
-    ),
+    norm: hfWeights.model.norm.weight.weights,
+    lm_head: hfWeights.lm_head?.weight?.weights ??
+      hfWeights.model.embed_tokens.weight.weights,
   };
 
   return { config, weights };
 }
 
 function readAdapter(
-  hfConfig: TransformersModel["config"],
-  hfAdapterConfig: TransformersModel["config"],
-  hfAdapterWeights: TransformersModel["weights"],
+  hfConfig: TransformersModel<Float32Array>["config"],
+  hfAdapterConfig: TransformersModel<Float32Array>["config"],
+  hfAdapterWeights: TransformersModel<Float32Array>["weights"],
 ) {
   const adapterConfig: AdapterConfig = {
-    rank: hfAdapterConfig.r,
-    alpha: hfAdapterConfig.lora_alpha,
+    rank: hfAdapterConfig.r as number,
+    alpha: hfAdapterConfig.lora_alpha as number,
   };
 
   const adapterWeights: AdapterWeights = {
-    q_proj_a: hfAdapterConfig.target_modules.includes("q_proj")
+    q_proj_a: (hfAdapterConfig.target_modules as string[]).includes("q_proj")
       ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
         permuteReverse(
           new Float32Array(l.self_attn.q_proj.lora_A.weight.weights),
-          hfConfig.num_attention_heads,
-          hfConfig.hidden_size,
-          hfAdapterConfig.r,
+          hfConfig.num_attention_heads as number,
+          hfConfig.hidden_size as number,
+          hfAdapterConfig.r as number,
         )
       )
       : undefined,
-    q_proj_b: hfAdapterConfig.target_modules.includes("q_proj")
+    q_proj_b: (hfAdapterConfig.target_modules as string[]).includes("q_proj")
       ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
         permuteReverse(
           new Float32Array(l.self_attn.q_proj.lora_B.weight.weights),
-          hfConfig.num_attention_heads,
-          hfConfig.hidden_size,
-          hfAdapterConfig.r,
+          hfConfig.num_attention_heads as number,
+          hfConfig.hidden_size as number,
+          hfAdapterConfig.r as number,
         )
       )
       : undefined,
-    k_proj_a: hfAdapterConfig.target_modules.includes("k_proj")
+    k_proj_a: (hfAdapterConfig.target_modules as string[]).includes("k_proj")
       ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
         permuteReverse(
           new Float32Array(l.self_attn.k_proj.lora_A.weight.weights),
-          hfConfig.num_attention_heads,
-          hfConfig.hidden_size,
-          hfAdapterConfig.r,
+          hfConfig.num_attention_heads as number,
+          hfConfig.hidden_size as number,
+          hfAdapterConfig.r as number,
         )
       )
       : undefined,
-    k_proj_b: hfAdapterConfig.target_modules.includes("k_proj")
+    k_proj_b: (hfAdapterConfig.target_modules as string[]).includes("k_proj")
       ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
         permuteReverse(
           new Float32Array(l.self_attn.k_proj.lora_B.weight.weights),
-          hfConfig.num_attention_heads,
-          hfConfig.hidden_size,
-          hfAdapterConfig.r,
+          hfConfig.num_attention_heads as number,
+          hfConfig.hidden_size as number,
+          hfAdapterConfig.r as number,
         )
       )
       : undefined,
-    v_proj_a: hfAdapterConfig.target_modules.includes("v_proj")
+    v_proj_a: (hfAdapterConfig.target_modules as string[]).includes("v_proj")
       ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
         new Float32Array(l.self_attn.v_proj.lora_A.weight.weights)
       )
       : undefined,
-    v_proj_b: hfAdapterConfig.target_modules.includes("v_proj")
+    v_proj_b: (hfAdapterConfig.target_modules as string[]).includes("v_proj")
       ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
         new Float32Array(l.self_attn.v_proj.lora_B.weight.weights)
       )
       : undefined,
-    o_proj_a: hfAdapterConfig.target_modules.includes("o_proj")
+    o_proj_a: (hfAdapterConfig.target_modules as string[]).includes("o_proj")
       ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
         new Float32Array(l.self_attn.o_proj.lora_A.weight.weights)
       )
       : undefined,
-    o_proj_b: hfAdapterConfig.target_modules.includes("o_proj")
+    o_proj_b: (hfAdapterConfig.target_modules as string[]).includes("o_proj")
       ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
         new Float32Array(l.self_attn.o_proj.lora_B.weight.weights)
       )
       : undefined,
-    gate_proj_a: hfAdapterConfig.target_modules.includes("gate_proj")
-      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-        new Float32Array(l.mlp.gate_proj.lora_A.weight.weights)
-      )
-      : undefined,
-    gate_proj_b: hfAdapterConfig.target_modules.includes("gate_proj")
-      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-        new Float32Array(l.mlp.gate_proj.lora_B.weight.weights)
-      )
-      : undefined,
-    down_proj_a: hfAdapterConfig.target_modules.includes("down_proj")
-      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-        new Float32Array(l.mlp.down_proj.lora_A.weight.weights)
-      )
-      : undefined,
-    down_proj_b: hfAdapterConfig.target_modules.includes("down_proj")
-      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-        new Float32Array(l.mlp.down_proj.lora_B.weight.weights)
-      )
-      : undefined,
-    up_proj_a: hfAdapterConfig.target_modules.includes("up_proj")
+    gate_proj_a:
+      (hfAdapterConfig.target_modules as string[]).includes("gate_proj")
+        ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+          new Float32Array(l.mlp.gate_proj.lora_A.weight.weights)
+        )
+        : undefined,
+    gate_proj_b:
+      (hfAdapterConfig.target_modules as string[]).includes("gate_proj")
+        ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+          new Float32Array(l.mlp.gate_proj.lora_B.weight.weights)
+        )
+        : undefined,
+    down_proj_a:
+      (hfAdapterConfig.target_modules as string[]).includes("down_proj")
+        ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+          new Float32Array(l.mlp.down_proj.lora_A.weight.weights)
+        )
+        : undefined,
+    down_proj_b:
+      (hfAdapterConfig.target_modules as string[]).includes("down_proj")
+        ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+          new Float32Array(l.mlp.down_proj.lora_B.weight.weights)
+        )
+        : undefined,
+    up_proj_a: (hfAdapterConfig.target_modules as string[]).includes("up_proj")
       ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
         new Float32Array(l.mlp.up_proj.lora_A.weight.weights)
       )
       : undefined,
-    up_proj_b: hfAdapterConfig.target_modules.includes("up_proj")
+    up_proj_b: (hfAdapterConfig.target_modules as string[]).includes("up_proj")
       ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
         new Float32Array(l.mlp.up_proj.lora_B.weight.weights)
       )
@@ -813,7 +559,7 @@ function main() {
   const [checkpoint, ...args] = Deno.args;
   let temperature = 1.0; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
   let topp = 1.0; // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
-  rng_seed = 0n; // seed rng with time by default
+  let rng_seed = 0; // seed rng with time by default
   let steps = 256; // max number of steps to run for, 0: use seq_len
   let prompt: string | null = null; // prompt string
   let adapter = null;
@@ -833,7 +579,7 @@ function main() {
         topp = parseFloat(val);
         break;
       case "s":
-        rng_seed = BigInt(parseInt(val));
+        rng_seed = parseInt(val);
         break;
       case "n":
         steps = parseInt(val);
@@ -848,9 +594,10 @@ function main() {
         return error_usage();
     }
   }
-  if (rng_seed == 0n) rng_seed = BigInt(Date.now());
+  set_seed(rng_seed || Date.now());
 
-  const { config: hfConfig, weights: hfWeights } = readHFRepo(
+  console.log('Loading model from "%s"...', checkpoint);
+  const { config: hfConfig, weights: hfWeights } = readHFRepo<Float32Array>(
     checkpoint + "/config.json",
     checkpoint + "/model.safetensors",
   );
@@ -859,7 +606,10 @@ function main() {
   let adapterConfig;
   let adapterWeights;
   if (adapter) {
-    const { config: hfAdapterConfig, weights: hfAdapterWeights } = readHFRepo(
+    console.log('Loading adapter from "%s"...', adapter);
+    const { config: hfAdapterConfig, weights: hfAdapterWeights } = readHFRepo<
+      Float32Array
+    >(
       adapter + "/adapter_config.json",
       adapter + "/adapter_model.safetensors",
     );
@@ -872,14 +622,15 @@ function main() {
     adapterWeights = model.adapterWeights;
   }
 
-  // right now we cannot run for more than config.seq_len steps
-  if (steps <= 0 || steps > config.seq_len) steps = config.seq_len;
-
   // read in the tokenizer.bin file
+  console.log("Loading tokenizer from tokenizer.bin...");
   const { vocab, vocab_scores } = readTokenizer(
     "tokenizer.bin",
     config.vocab_size,
   );
+
+  // right now we cannot run for more than config.seq_len steps
+  if (steps <= 0 || steps > config.seq_len) steps = config.seq_len;
 
   // create and init the application RunState
   const state = newRunState(config);
@@ -900,7 +651,7 @@ function main() {
     vocab_scores,
     prompt_tokens,
   );
-  console.log(prompt_tokens, num_prompt_tokens); //   1, 1126,  306
+  //console.log(prompt_tokens, num_prompt_tokens);
 
   // start the main loop
   let start = 0; // used to time our code, only initialized after first iteration
@@ -929,7 +680,12 @@ function main() {
       next = prompt_tokens[pos + 1];
     } else {
       // sample the next token
-      next = sample(temperature, state, config, topp);
+      next = sample(
+        state.logits,
+        config.vocab_size,
+        temperature,
+        topp,
+      );
     }
     pos++;
 
@@ -955,8 +711,9 @@ function main() {
 
 function error_usage(): never {
   console.error("Usage: ... llama2.ts <checkpoint> [options]");
-  console.error('Example: llama2.ts model.bin -n 256 -i "Once upon a time"');
+  console.error('Example: llama2.ts ./model/ -n 256 -i "Once upon a time"');
   console.error("Options:");
+  console.error("  -a <string> adapter checkpoint (optional, default: none)");
   console.error("  -t <float>  temperature, default 1.0");
   console.error(
     "  -p <float>  p value in top-p (nucleus) sampling. default 0.9, 0 = off",
