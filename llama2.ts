@@ -6,7 +6,11 @@
 // Use bun or t348 to run. see params at the end of the file or in the README.
 import * as fs from "node:fs";
 import { writeAllSync } from "https://deno.land/std/io/mod.ts";
-import { readHFRepo, TransformersModel } from "./safetensors.ts";
+import {
+  permuteReverse,
+  readHFRepo,
+  TransformersModel,
+} from "./safetensors.ts";
 
 // ----------------------------------------------------------------------------
 // binary utils
@@ -23,6 +27,7 @@ interface Config {
   vocab_size: int;
   seq_len: int;
   head_size: int;
+  rope_theta: float;
   norm_eps?: float;
 }
 
@@ -41,6 +46,28 @@ interface TransformerWeights {
   wcls: Float32Array;
 }
 
+interface AdapterConfig {
+  rank: int;
+  alpha: int;
+}
+
+interface AdapterWeights {
+  q_proj_a?: Float32Array[];
+  q_proj_b?: Float32Array[];
+  k_proj_a?: Float32Array[];
+  k_proj_b?: Float32Array[];
+  v_proj_a?: Float32Array[];
+  v_proj_b?: Float32Array[];
+  down_proj_a?: Float32Array[];
+  down_proj_b?: Float32Array[];
+  o_proj_a?: Float32Array[];
+  o_proj_b?: Float32Array[];
+  gate_proj_a?: Float32Array[];
+  gate_proj_b?: Float32Array[];
+  up_proj_a?: Float32Array[];
+  up_proj_b?: Float32Array[];
+}
+
 interface RunState {
   // current wave of activations
   x: Float32Array;
@@ -57,6 +84,16 @@ interface RunState {
   value_cache: Float32Array;
   indices: { prob: float; index: int }[];
 }
+
+interface AdapterRunState {
+  q_r: Float32Array;
+  k_r: Float32Array;
+  v_r: Float32Array;
+  o_r: Float32Array;
+  gate_r: Float32Array;
+  down_r: Float32Array;
+  up_r: Float32Array;
+}
 function newRunState(config: Config): RunState {
   const kv_dim = (config.dim * config.n_kv_heads) / config.n_heads;
   const s = {} as RunState;
@@ -67,14 +104,25 @@ function newRunState(config: Config): RunState {
   s.hb = new Float32Array(config.hidden_dim);
   s.hb2 = new Float32Array(config.hidden_dim);
   s.q = new Float32Array(config.dim);
-  s.k = new Float32Array(config.dim);
-  s.v = new Float32Array(config.dim);
+  s.k = new Float32Array(kv_dim);
+  s.v = new Float32Array(kv_dim);
   s.att = new Float32Array(config.n_heads * config.seq_len);
   s.logits = new Float32Array(config.vocab_size);
   s.key_cache = new Float32Array(config.n_layers * config.seq_len * kv_dim);
   s.value_cache = new Float32Array(
     config.n_layers * config.seq_len * kv_dim,
   );
+  return s;
+}
+function newAdapterState(config: AdapterConfig): AdapterRunState {
+  const s = {} as AdapterRunState;
+  s.q_r = new Float32Array(config.rank);
+  s.k_r = new Float32Array(config.rank);
+  s.v_r = new Float32Array(config.rank);
+  s.down_r = new Float32Array(config.rank);
+  s.o_r = new Float32Array(config.rank);
+  s.gate_r = new Float32Array(config.rank);
+  s.up_r = new Float32Array(config.rank);
   return s;
 }
 
@@ -130,9 +178,34 @@ function matmul(
   for (let i = 0; i < d; i++) {
     let sum = 0;
     for (let j = 0; j < n; j++) {
+      if (i * n + j >= w.length) {
+        throw new Error("matmul weights out of bounds");
+      }
+      if (j >= x.length) throw new Error("matmul activations out of bounds");
       sum += w[i * n + j] * x[j];
     }
+    if (i >= xout.length) throw new Error("matmul output out of bounds");
     xout[i] = sum; //sumAccumulator[0];
+  }
+}
+function matmuladd(
+  xout: Float32Array,
+  x: Float32Array,
+  w: Float32Array,
+  n: number,
+  d: number,
+  scale: number = 1.0,
+): void {
+  // W (d, n) @ x (n,) -> xout (d,)
+  for (let i = 0; i < d; i++) {
+    let sum = 0;
+    for (let j = 0; j < n; j++) {
+      //if (i * n + j >= w.length) throw new Error("matmul weights out of bounds");
+      //if (j >= x.length) throw new Error("matmul activations out of bounds");
+      sum += w[i * n + j] * x[j];
+    }
+    //if (i >= xout.length) throw new Error("matmul output out of bounds");
+    xout[i] += sum * scale; //sumAccumulator[0];
   }
 }
 
@@ -142,6 +215,9 @@ function forward(
   p: Config,
   s: RunState,
   w: TransformerWeights,
+  pa?: AdapterConfig,
+  sa?: AdapterRunState,
+  wa?: AdapterWeights,
 ): void {
   const x = s.x;
   const dim = p.dim;
@@ -150,6 +226,8 @@ function forward(
 
   const hidden_dim = p.hidden_dim;
   const head_size = dim / p.n_heads;
+
+  const adapter_scale = pa ? pa.rank / pa.alpha : 0;
 
   // copy the token embedding into x
   x.set(w.token_embedding_table.subarray(token * dim, token * dim + dim));
@@ -173,32 +251,57 @@ function forward(
     );
 
     // qkv matmuls for this position
+    //console.log("QKV matmuls");
     matmul(s.q, s.xb, w.wq[l], dim, dim);
     matmul(s.k, s.xb, w.wk[l], dim, kv_dim);
     matmul(s.v, s.xb, w.wv[l], dim, kv_dim);
-    //console.log("s.q[0]: %f", s.q[0]);
-    //console.log("s.k[0]: %f", s.k[0]);
-    //console.log("s.v[0]: %f", s.v[0]);
+
+    // LoRA adapter
+    if (pa && sa && wa) {
+      //console.log("LoRA matmuls");
+      if (wa.q_proj_a) {
+        matmul(sa.q_r, s.xb, wa.q_proj_a[l], dim, pa.rank);
+      }
+      if (wa.k_proj_a) {
+        matmul(sa.k_r, s.xb, wa.k_proj_a[l], dim, pa.rank);
+      }
+      if (wa.v_proj_a) {
+        matmul(sa.v_r, s.xb, wa.v_proj_a[l], kv_dim, pa.rank);
+      }
+      if (wa.q_proj_b) {
+        matmuladd(s.q, sa.q_r, wa.q_proj_b[l], pa.rank, dim, adapter_scale);
+      }
+      if (wa.k_proj_b) {
+        matmuladd(s.k, sa.k_r, wa.k_proj_b[l], pa.rank, kv_dim, adapter_scale);
+      }
+      if (wa.v_proj_b) {
+        matmuladd(s.v, sa.v_r, wa.v_proj_b[l], pa.rank, kv_dim, adapter_scale);
+      }
+    }
 
     // RoPE relative positional encoding: complex-valued rotate q and k by freq_cis in each head
+    //console.log('RoPE');
     for (let i = 0; i < dim; i += 2) {
       const head_dim = i % head_size;
-      const freq = 1.0 / Math.pow(10000.0, head_dim / head_size);
+      const freq = 1.0 / Math.pow(p.rope_theta, head_dim / head_size);
       const val = pos * freq;
       const fcr = Math.cos(val);
       const fci = Math.sin(val);
 
-      const rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-      for (let v = 0; v < rotn; v++) {
-        const vec = v == 0 ? s.q : s.k; // the vector to rotate (query or key)
-        const v0 = vec[i];
-        const v1 = vec[i + 1];
-        vec[i] = v0 * fcr - v1 * fci;
-        vec[i + 1] = v0 * fci + v1 * fcr;
+      if (i < kv_dim) {
+        const v0 = s.k[i];
+        const v1 = s.k[i + 1];
+        s.k[i] = v0 * fcr - v1 * fci;
+        s.k[i + 1] = v0 * fci + v1 * fcr;
       }
+
+      const v0 = s.q[i];
+      const v1 = s.q[i + 1];
+      s.q[i] = v0 * fcr - v1 * fci;
+      s.q[i + 1] = v0 * fci + v1 * fcr;
     }
 
-    // multihead attention. iterate over all heads
+    //console.log("Multi-Headed Attention");
     for (let h = 0; h < p.n_heads; h++) {
       let q = s.q.subarray(h * head_size, h * head_size + head_size);
       let att = s.att.subarray(h * p.seq_len, h * p.seq_len + p.seq_len);
@@ -235,18 +338,56 @@ function forward(
     }
 
     // final matmul to get the output of the attention
+    //console.log("Attention output");
     matmul(s.xb2, s.xb, w.wo[l], dim, dim);
+    if (pa && sa && wa) {
+      if (wa.o_proj_a) {
+        matmul(sa.o_r, s.xb, wa.o_proj_a[l], dim, pa.rank);
+      }
+      if (wa.o_proj_b) {
+        matmuladd(s.xb2, sa.o_r, wa.o_proj_b[l], pa.rank, dim, adapter_scale);
+      }
+    }
 
-    // residual connection back into x
+    //console.log("Residual connections");
     accum(x, s.xb2, dim);
 
-    // ffn rmsnorm
+    //console.log("FFN rmsnorm");
     rmsnorm(s.xb, x, w.rms_ffn_weight[l], dim);
 
+    //console.log("FFN Gate + Up");
     // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
     // first calculate self.w1(x) and self.w3(x)
     matmul(s.hb, s.xb, w.w1[l], dim, hidden_dim);
     matmul(s.hb2, s.xb, w.w3[l], dim, hidden_dim);
+    if (pa && sa && wa) {
+      if (wa.gate_proj_a) {
+        matmul(sa.gate_r, s.xb, wa.gate_proj_a[l], dim, pa.rank);
+      }
+      if (wa.up_proj_a) {
+        matmul(sa.up_r, s.xb, wa.up_proj_a[l], dim, pa.rank);
+      }
+      if (wa.gate_proj_b) {
+        matmuladd(
+          s.hb,
+          sa.gate_r,
+          wa.gate_proj_b[l],
+          pa.rank,
+          hidden_dim,
+          adapter_scale,
+        );
+      }
+      if (wa.up_proj_b) {
+        matmuladd(
+          s.hb2,
+          sa.up_r,
+          wa.up_proj_b[l],
+          pa.rank,
+          hidden_dim,
+          adapter_scale,
+        );
+      }
+    }
 
     // F.silu; silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
     for (let i = 0; i < hidden_dim; i++) {
@@ -256,10 +397,26 @@ function forward(
     // elementwise multiply with w3(x)
     for (let i = 0; i < hidden_dim; i++) s.hb[i] = s.hb[i] * s.hb2[i];
 
+    //console.log("FFN Final output");
     // final matmul to get the output of the ffn
     matmul(s.xb, s.hb, w.w2[l], hidden_dim, dim);
+    if (pa && sa && wa) {
+      if (wa.down_proj_a) {
+        matmul(sa.down_r, s.hb, wa.down_proj_a[l], hidden_dim, pa.rank);
+      }
+      if (wa.down_proj_b) {
+        matmuladd(
+          s.xb,
+          sa.down_r,
+          wa.down_proj_b[l],
+          pa.rank,
+          dim,
+          adapter_scale,
+        );
+      }
+    }
 
-    // residual connection
+    //console.log("Residual connections");
     accum(x, s.xb, dim);
   }
 
@@ -451,62 +608,6 @@ function decode(vocab: string[], prev_token: number, token: number): string {
   return piece;
 }
 
-function permuteReverse(
-  w: Float32Array,
-  n_heads: number,
-  dim1: number,
-  dim2: number,
-): Float32Array {
-  const newShape = [n_heads, 2, Math.floor(dim1 / n_heads / 2), dim2];
-
-  // Reshape w into newShape
-  const reshaped: number[][][][] = [];
-  let index = 0;
-  for (let i = 0; i < newShape[0]; i++) {
-    reshaped[i] = [];
-    for (let j = 0; j < newShape[1]; j++) {
-      reshaped[i][j] = [];
-      for (let k = 0; k < newShape[2]; k++) {
-        reshaped[i][j][k] = [];
-        for (let l = 0; l < newShape[3]; l++) {
-          reshaped[i][j][k][l] = w[index++];
-        }
-      }
-    }
-  }
-
-  // Transpose (1, 2) => (0, 2, 1, 3)
-  const transposed: number[][][][] = [];
-  for (let i = 0; i < newShape[0]; i++) {
-    transposed[i] = [];
-    for (let k = 0; k < newShape[2]; k++) {
-      transposed[i][k] = [];
-      for (let j = 0; j < newShape[1]; j++) {
-        transposed[i][k][j] = reshaped[i][j][k];
-      }
-    }
-  }
-
-  // Flatten the transposed array and reshape it into [dim1, dim2]
-  const flattened: number[] = [];
-  for (let i = 0; i < newShape[0]; i++) {
-    for (let k = 0; k < newShape[2]; k++) {
-      for (let j = 0; j < newShape[1]; j++) {
-        for (let l = 0; l < newShape[3]; l++) {
-          flattened.push(transposed[i][k][j][l]);
-        }
-      }
-    }
-  }
-
-  const result = new Float32Array(dim1 * dim2);
-  for (let i = 0; i < result.length; i++) {
-    result[i] = flattened[i];
-  }
-
-  return result;
-}
-
 function readTokenizer(tokenizerPath: string, vocab_size: number) {
   let vocab = new Array<string>(vocab_size);
   let vocab_scores = new Array<number>(vocab_size);
@@ -546,6 +647,7 @@ function readModel(
     n_layers: hfConfig.num_hidden_layers,
     seq_len: hfConfig.max_position_embeddings,
     vocab_size: hfConfig.vocab_size,
+    rope_theta: hfConfig.rope_theta,
     norm_eps: hfConfig.rms_norm_eps,
   };
 
@@ -600,6 +702,112 @@ function readModel(
   return { config, weights };
 }
 
+function readAdapter(
+  hfConfig: TransformersModel["config"],
+  hfAdapterConfig: TransformersModel["config"],
+  hfAdapterWeights: TransformersModel["weights"],
+) {
+  const adapterConfig: AdapterConfig = {
+    rank: hfAdapterConfig.r,
+    alpha: hfAdapterConfig.lora_alpha,
+  };
+
+  const adapterWeights: AdapterWeights = {
+    q_proj_a: hfAdapterConfig.target_modules.includes("q_proj")
+      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+        permuteReverse(
+          new Float32Array(l.self_attn.q_proj.lora_A.weight.weights),
+          hfConfig.num_attention_heads,
+          hfConfig.hidden_size,
+          hfAdapterConfig.r,
+        )
+      )
+      : undefined,
+    q_proj_b: hfAdapterConfig.target_modules.includes("q_proj")
+      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+        permuteReverse(
+          new Float32Array(l.self_attn.q_proj.lora_B.weight.weights),
+          hfConfig.num_attention_heads,
+          hfConfig.hidden_size,
+          hfAdapterConfig.r,
+        )
+      )
+      : undefined,
+    k_proj_a: hfAdapterConfig.target_modules.includes("k_proj")
+      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+        permuteReverse(
+          new Float32Array(l.self_attn.k_proj.lora_A.weight.weights),
+          hfConfig.num_attention_heads,
+          hfConfig.hidden_size,
+          hfAdapterConfig.r,
+        )
+      )
+      : undefined,
+    k_proj_b: hfAdapterConfig.target_modules.includes("k_proj")
+      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+        permuteReverse(
+          new Float32Array(l.self_attn.k_proj.lora_B.weight.weights),
+          hfConfig.num_attention_heads,
+          hfConfig.hidden_size,
+          hfAdapterConfig.r,
+        )
+      )
+      : undefined,
+    v_proj_a: hfAdapterConfig.target_modules.includes("v_proj")
+      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+        new Float32Array(l.self_attn.v_proj.lora_A.weight.weights)
+      )
+      : undefined,
+    v_proj_b: hfAdapterConfig.target_modules.includes("v_proj")
+      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+        new Float32Array(l.self_attn.v_proj.lora_B.weight.weights)
+      )
+      : undefined,
+    o_proj_a: hfAdapterConfig.target_modules.includes("o_proj")
+      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+        new Float32Array(l.self_attn.o_proj.lora_A.weight.weights)
+      )
+      : undefined,
+    o_proj_b: hfAdapterConfig.target_modules.includes("o_proj")
+      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+        new Float32Array(l.self_attn.o_proj.lora_B.weight.weights)
+      )
+      : undefined,
+    gate_proj_a: hfAdapterConfig.target_modules.includes("gate_proj")
+      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+        new Float32Array(l.mlp.gate_proj.lora_A.weight.weights)
+      )
+      : undefined,
+    gate_proj_b: hfAdapterConfig.target_modules.includes("gate_proj")
+      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+        new Float32Array(l.mlp.gate_proj.lora_B.weight.weights)
+      )
+      : undefined,
+    down_proj_a: hfAdapterConfig.target_modules.includes("down_proj")
+      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+        new Float32Array(l.mlp.down_proj.lora_A.weight.weights)
+      )
+      : undefined,
+    down_proj_b: hfAdapterConfig.target_modules.includes("down_proj")
+      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+        new Float32Array(l.mlp.down_proj.lora_B.weight.weights)
+      )
+      : undefined,
+    up_proj_a: hfAdapterConfig.target_modules.includes("up_proj")
+      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+        new Float32Array(l.mlp.up_proj.lora_A.weight.weights)
+      )
+      : undefined,
+    up_proj_b: hfAdapterConfig.target_modules.includes("up_proj")
+      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
+        new Float32Array(l.mlp.up_proj.lora_B.weight.weights)
+      )
+      : undefined,
+  };
+
+  return { adapterConfig, adapterWeights };
+}
+
 function main() {
   //console.log(Deno.args);
   const [checkpoint, ...args] = Deno.args;
@@ -608,6 +816,7 @@ function main() {
   rng_seed = 0n; // seed rng with time by default
   let steps = 256; // max number of steps to run for, 0: use seq_len
   let prompt: string | null = null; // prompt string
+  let adapter = null;
 
   if (!checkpoint) return error_usage();
   for (let i = 0; i < args.length; i += 2) {
@@ -632,6 +841,9 @@ function main() {
       case "i":
         prompt = val;
         break;
+      case "a":
+        adapter = val;
+        break;
       default:
         return error_usage();
     }
@@ -644,6 +856,22 @@ function main() {
   );
   const { config, weights } = readModel(hfConfig, hfWeights);
 
+  let adapterConfig;
+  let adapterWeights;
+  if (adapter) {
+    const { config: hfAdapterConfig, weights: hfAdapterWeights } = readHFRepo(
+      adapter + "/adapter_config.json",
+      adapter + "/adapter_model.safetensors",
+    );
+    const model = readAdapter(
+      hfConfig,
+      hfAdapterConfig,
+      hfAdapterWeights,
+    );
+    adapterConfig = model.adapterConfig;
+    adapterWeights = model.adapterWeights;
+  }
+
   // right now we cannot run for more than config.seq_len steps
   if (steps <= 0 || steps > config.seq_len) steps = config.seq_len;
 
@@ -654,7 +882,10 @@ function main() {
   );
 
   // create and init the application RunState
-  let state = newRunState(config);
+  const state = newRunState(config);
+  const adapterState = adapterConfig
+    ? newAdapterState(adapterConfig)
+    : undefined;
   if (prompt == null) prompt = "";
 
   // encode the (string) prompt into tokens sequence
@@ -669,6 +900,7 @@ function main() {
     vocab_scores,
     prompt_tokens,
   );
+  console.log(prompt_tokens, num_prompt_tokens); //   1, 1126,  306
 
   // start the main loop
   let start = 0; // used to time our code, only initialized after first iteration
@@ -678,7 +910,16 @@ function main() {
   while (pos < steps) {
     //console.log("Step %d", pos + 1);
     // forward the transformer to get logits for the next token
-    forward(token, pos, config, state, weights);
+    forward(
+      token,
+      pos,
+      config,
+      state,
+      weights,
+      adapterConfig,
+      adapterState,
+      adapterWeights,
+    );
 
     //console.log("Step %d decoding", pos + 1);
 
