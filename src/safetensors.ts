@@ -232,46 +232,7 @@ export function readHFRepo<const D extends SUPPORTED_DTYPES>(
   >;
 }
 
-/*
-// 1 and -2
-console.log(
-  bf16ToF32(new Uint8Array([0b10000000, 0b00111111, 0b00000000, 0b11000000])),
-);
-
-// 0 and -0
-console.log(
-  bf16ToF32(new Uint8Array([0b00000000, 0b00000000, 0b00000000, 0b10000000])),
-);
-
-// inf and -inf
-console.log(
-  bf16ToF32(new Uint8Array([0b10000000, 0b01111111, 0b10000000, 0b11111111])),
-);
-
-// qnan and snan
-console.log(
-  bf16ToF32(new Uint8Array([0b11000001, 0b01111111, 0b10000001, 0b01111111])),
-);
-
-// pi and 1/3
-console.log(
-  bf16ToF32(new Uint8Array([0b01001001, 0b01000000, 0b10101011, 0b00111110])),
-);
-
-console.log(
-  bf16ToF32(new Uint8Array([0xcd, 0x3d, 0x24, 0x3c, 0x83, 0x3a])),
-);
-
-const { metadata, weights } = readSafetensors(
-  "../llama2.c/TinyLlama-1.1B-Medical/adapter_model.safetensors",
-);
-console.log(
-  weights.base_model.model.model.layers[15].self_attn.v_proj.lora_A.weight
-    .weights,
-);
-*/
-
-function fp16ToF32(input: Uint8Array) {
+export function fp16ToF32(input: Uint8Array) {
   const input16 = new Float16Array(input.buffer);
   const output = new Float32Array(input16.length);
   for (let i = 0; i < input16.length; i++) {
@@ -280,7 +241,7 @@ function fp16ToF32(input: Uint8Array) {
   return output;
 }
 
-function bf16ToF32(input: Uint8Array) {
+export function bf16ToF32(input: Uint8Array) {
   const output = new Float32Array(input.length / 2);
   for (let i = 0; i < output.length; i++) {
     const msb = input[i * 2 + 0];
@@ -311,7 +272,7 @@ function bf16ToF32(input: Uint8Array) {
   return output;
 }
 
-function _nf4tof32(input: Uint8Array) {
+export function nf4tof32(input: Uint8Array) {
   const output = new Float32Array(input.length * 2);
   for (let i = 0; i < output.length; i += 2) {
     const val1 = input[i] & 0b00001111;

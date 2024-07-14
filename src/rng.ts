@@ -11,8 +11,6 @@ export function random_u32(): number {
   return Number(((rng_seed * 0x2545F4914F6CDD1Dn) >> 32n) & 0xffffffffn);
 }
 
-const floatCaster = new Float32Array(1);
 export function random_f32() { // random float32 in [0,1)
-  floatCaster[0] = (random_u32() / 256) / 16777216.0;
-  return floatCaster[0]; // force f32
+  return Math.fround((random_u32() / 256) / 16777216.0);
 }

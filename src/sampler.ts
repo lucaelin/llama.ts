@@ -1,14 +1,7 @@
-import { softmax } from "./kernels.ts";
+import { argmax, softmax } from "./kernels.ts";
 import { random_f32 } from "./rng.ts";
 
 type float = number;
-
-function argmax(arr: Float32Array): number {
-  return arr.reduce(
-    (maxIdx, val, idx, array) => (val > array[maxIdx] ? idx : maxIdx),
-    0,
-  );
-}
 
 export function sample(
   logits: Float32Array,
@@ -19,7 +12,7 @@ export function sample(
   // sample the token given the logits and some hyperparameters
   if (temperature == 0.0) {
     // greedy argmax sampling: take the token with the highest probability
-    return argmax(logits);
+    return argmax(logits, vocab_size);
   } else {
     // apply the temperature to the logits
     for (let q = 0; q < vocab_size; q++) {

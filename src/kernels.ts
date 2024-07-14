@@ -39,6 +39,18 @@ export function softmax(x: Float32Array, size: number): void {
   }
 }
 
+export function argmax(arr: Float32Array, size: number): number {
+  let max_val = arr[0];
+  let max_idx = 0;
+  for (let i = 1; i < size; i++) {
+    if (arr[i] > max_val) {
+      max_val = arr[i];
+      max_idx = i;
+    }
+  }
+  return max_idx;
+}
+
 export function matmul(
   o: Float32Array,
   x: Float32Array,
