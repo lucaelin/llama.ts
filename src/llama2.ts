@@ -11,7 +11,7 @@ import {
   readHFRepo,
   TransformersModel,
 } from "./safetensors.ts";
-import { accum, elemmul, matmul, matmuladd, rmsnorm, silu } from "./kernels.ts";
+import { accum, elemmul, matmul, rmsnorm, silu } from "./kernels.ts";
 import { lora, mutlihead_attention, rope } from "./transformer.ts";
 import { decode, encode } from "./sentencepiece.ts";
 import { sample } from "./sampler.ts";

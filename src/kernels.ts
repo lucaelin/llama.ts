@@ -52,7 +52,7 @@ export function matmul(
     for (let j = 0; j < n; j++) {
       //if (i * n + j >= w.length) throw new Error("matmul weights out of bounds");
       //if (j >= x.length) throw new Error("matmul activations out of bounds");
-      sum += w[i * n + j] * x[j];
+      sum += w[i * n + j | 0] * x[j];
     }
     //if (i >= o.length) throw new Error("matmul output out of bounds");
     o[i] = sum;
