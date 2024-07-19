@@ -1,3 +1,5 @@
+import { Q8Array } from "./quantization.ts";
+
 export function accum(a: Float32Array, b: Float32Array, size: number): void {
   for (let i = 0; i < size; i++) a[i] += b[i];
 }
@@ -70,6 +72,44 @@ export function matmul(
     o[i] = sum;
   }
 }
+
+export function qmatmul(
+  o: Float32Array,
+  x: Q8Array,
+  w: Q8Array,
+  n: number,
+  d: number,
+  GS: number,
+): void {
+  // W (d,n) @ x (n,) -> xout (d,)
+  // by far the most amount of time is spent inside this little function
+  // inputs to this function are both quantized
+
+  if (x.gs !== GS || w.gs !== GS) {
+    throw new Error("Group size mismatch");
+  }
+  if (x.q.length !== n || w.q.length !== n * d) {
+    throw new Error("Quantized array size mismatch");
+  }
+
+  for (let i = 0; i < d; i++) {
+    let val = 0.0;
+    const itn = i * n;
+
+    // do the matmul in groups of GS
+    for (let j = 0; j <= n - GS; j += GS) {
+      let ival = 0;
+      for (let k = 0; k < GS; k++) {
+        ival += x.q[j + k] * w.q[itn + j + k];
+      }
+      const bar = ival * w.s[((itn + j) / GS) | 0];
+      val += bar * x.s[(j / GS) | 0];
+    }
+
+    o[i] = val;
+  }
+}
+
 export function matmuladd(
   o: Float32Array,
   x: Float32Array,
@@ -88,6 +128,44 @@ export function matmuladd(
     }
     //if (i >= xout.length) throw new Error("matmul output out of bounds");
     o[i] += sum * scale;
+  }
+}
+
+export function qmatmuladd(
+  o: Float32Array,
+  x: Q8Array,
+  w: Q8Array,
+  n: number,
+  d: number,
+  GS: number,
+  scale: number = 1.0,
+): void {
+  // W (d,n) @ x (n,) -> xout (d,)
+  // by far the most amount of time is spent inside this little function
+  // inputs to this function are both quantized
+
+  if (x.gs !== GS || w.gs !== GS) {
+    throw new Error("Group size mismatch");
+  }
+  if (x.q.length !== n || w.q.length !== n * d) {
+    throw new Error("Quantized array size mismatch");
+  }
+
+  for (let i = 0; i < d; i++) {
+    let val = 0.0;
+    const itn = i * n;
+
+    // do the matmul in groups of GS
+    for (let j = 0; j <= n - GS; j += GS) {
+      let ival = 0;
+      for (let k = 0; k < GS; k++) {
+        ival += x.q[j + k] * w.q[itn + j + k];
+      }
+      const bar = ival * w.s[((itn + j) / GS) | 0];
+      val += bar * x.s[(j / GS) | 0];
+    }
+
+    o[i] += val * scale;
   }
 }
 

@@ -1,25 +1,91 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Buffer } from "node:buffer";
+import {
+  DEFAULT_GROUP_SIZE,
+  dequantize,
+  newQ8ArrayFrom,
+  Q8Array,
+  q8ArrayToFloat32Array,
+} from "./quantization.ts";
 
 function raise(message: string): never {
   throw new Error(message);
 }
 
 const DTYPE_MAPPING = {
-  F64: Float64Array,
-  F32: Float32Array,
-  F16: Float16Array,
-  BF16: Float32Array,
-  I64: BigInt64Array,
-  I32: Int32Array,
-  I16: Int16Array,
-  I8: Int8Array,
-  U8: Uint8Array,
-  BOOL: Uint8Array,
+  F64: (buffer: Uint8Array) =>
+    new Float64Array(
+      buffer.buffer,
+      0,
+      buffer.byteLength / Float64Array.BYTES_PER_ELEMENT,
+    ),
+  F32: (buffer: Uint8Array) =>
+    new Float32Array(
+      buffer.buffer,
+      0,
+      buffer.byteLength / Float32Array.BYTES_PER_ELEMENT,
+    ),
+  F16: (buffer: Uint8Array) =>
+    new Float16Array(
+      buffer.buffer,
+      0,
+      buffer.byteLength / Float16Array.BYTES_PER_ELEMENT,
+    ),
+  BF16: (buffer: Uint8Array) => bf16ToF32(buffer),
+  I64: (buffer: Uint8Array) =>
+    new BigInt64Array(
+      buffer.buffer,
+      0,
+      buffer.byteLength / BigInt64Array.BYTES_PER_ELEMENT,
+    ),
+  I32: (buffer: Uint8Array) =>
+    new Int32Array(
+      buffer.buffer,
+      0,
+      buffer.byteLength / Int32Array.BYTES_PER_ELEMENT,
+    ),
+  I16: (buffer: Uint8Array) =>
+    new Int16Array(
+      buffer.buffer,
+      0,
+      buffer.byteLength / Int16Array.BYTES_PER_ELEMENT,
+    ),
+  I8: (buffer: Uint8Array) =>
+    new Int8Array(
+      buffer.buffer,
+      0,
+      buffer.byteLength / Int8Array.BYTES_PER_ELEMENT,
+    ),
+  U8: (buffer: Uint8Array) =>
+    new Uint8Array(
+      buffer.buffer,
+      0,
+      buffer.byteLength / Uint8Array.BYTES_PER_ELEMENT,
+    ),
+  BOOL: (buffer: Uint8Array, offset?: number, length?: number) =>
+    new Uint8Array(buffer.buffer, offset, length),
 };
 
-type SUPPORTED_DTYPES = keyof typeof DTYPE_MAPPING;
+const OUTPUT_DTYPE_MAPPING = {
+  "F32": (buffer: ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>) =>
+    new Float32Array(buffer),
+  "Q8_0": (buffer: ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>) =>
+    newQ8ArrayFrom(
+      buffer instanceof Float32Array ? buffer : new Float32Array(buffer),
+      DEFAULT_GROUP_SIZE,
+    ),
+  "raw": (buffer: ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>) =>
+    new Uint8Array(buffer.buffer, 0, buffer.byteLength),
+  "unknown": (
+    buffer: ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>,
+  ) => buffer,
+};
+
+type SUPPORTED_DTYPE_NAMES = keyof typeof DTYPE_MAPPING;
+type SUPPORTED_DTYPES = ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>;
+
+type OUTPUT_DTYPE_NAMES = keyof typeof OUTPUT_DTYPE_MAPPING;
 
 type FileHandle = number & { [Symbol.toStringTag]: "FileHandle" };
 
@@ -48,11 +114,13 @@ type Header = {
   };
 };
 
-type WeightsEntry<D extends ArrayBufferLike> = HeaderEntry & { weights: D };
-interface RecursiveWeights<D extends ArrayBufferLike> {
+type WeightsEntry<D extends OUTPUT_DTYPE_NAMES> = HeaderEntry & {
+  weights: ReturnType<typeof OUTPUT_DTYPE_MAPPING[D]>;
+};
+interface RecursiveWeights<D extends OUTPUT_DTYPE_NAMES> {
   [key: string]: Weights<D>;
 }
-type Weights<D extends ArrayBufferLike> =
+type Weights<D extends OUTPUT_DTYPE_NAMES> =
   & RecursiveWeights<D>
   & { weight: WeightsEntry<D> }
   & { layers: RecursiveWeights<D>[] };
@@ -60,11 +128,10 @@ type Weights<D extends ArrayBufferLike> =
 function readSTHeader(handle: FileHandle): Header {
   const prefixBytes = new Uint8Array(8);
   fs.readSync(handle, prefixBytes, 0, prefixBytes.length, 0);
-  const actualHeaderLength = new DataView(prefixBytes.buffer).getBigUint64(
-    0,
-    true,
-  );
-  const headerLength = new DataView(prefixBytes.buffer).getUint32(0, true);
+  const actualHeaderLength = new DataView(prefixBytes.buffer)
+    .getBigUint64(0, true);
+  const headerLength = new DataView(prefixBytes.buffer)
+    .getUint32(0, true);
   if (actualHeaderLength > headerLength) {
     throw new Error("Header too large");
   }
@@ -83,58 +150,57 @@ function readSTWeights(
   handle: FileHandle,
   headerSize: number,
   entry: HeaderEntry,
-): InstanceType<typeof DTYPE_MAPPING[SUPPORTED_DTYPES]> {
-  const dtype = DTYPE_MAPPING[entry.dtype];
+): ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]> {
+  const intype = DTYPE_MAPPING[entry.dtype];
   const [start, end] = entry.offsets ?? entry.data_offsets ??
     raise("No offsets");
   const length = end - start;
-  const data = Buffer.alloc(length);
-  fs.readSync(handle, data, 0, length, start + headerSize);
+  const dataRaw = Buffer.alloc(length);
+  fs.readSync(handle, dataRaw, 0, length, start + headerSize);
   if (entry.dtype === "BF16") {
-    const input = new Uint8Array(data);
-    return bf16ToF32(input);
+    return bf16ToF32(new Uint8Array(dataRaw));
   }
-  return new dtype(
-    data.buffer,
-    data.byteOffset,
-    data.length / dtype.BYTES_PER_ELEMENT,
-  );
+  return intype(dataRaw);
 }
 
-type Safetensor<D extends SUPPORTED_DTYPES> = {
+type Safetensor<D extends OUTPUT_DTYPE_NAMES> = {
   metadata: Record<string, unknown>;
-  weights: RecursiveWeights<InstanceType<typeof DTYPE_MAPPING[D]>>;
+  weights: RecursiveWeights<D>;
+  dtype: D;
 };
 
-function readSafetensors<const D extends SUPPORTED_DTYPES>(
+function readSafetensors<const D extends OUTPUT_DTYPE_NAMES>(
   path: string,
   dtype: D,
+  options: { filter?: (layer: string) => boolean } = {},
 ): Safetensor<D> {
   const handle = fs.openSync(path, "r") as FileHandle;
   const header = readSTHeader(handle);
-  type ReturnDtype = InstanceType<typeof DTYPE_MAPPING[D]>;
 
-  const weights: RecursiveWeights<ReturnDtype> = {};
+  const weights: RecursiveWeights<D> = {};
 
   for (const [key, value] of Object.entries(header)) {
-    console.log("reading", key, value.shape);
     if (key === "__metadata__") {
       continue;
     }
+    if (options.filter && !options.filter(key)) {
+      continue;
+    }
+    console.log("reading", key, value.shape, dtype);
     const dataRaw = readSTWeights(
       handle,
       header.__metadata__.headerLength,
       value as HeaderEntry,
     );
-    const data = new DTYPE_MAPPING[dtype](dataRaw);
+    const data = OUTPUT_DTYPE_MAPPING[dtype](dataRaw);
 
     const path = key.split(".");
-    let current: Weights<ReturnDtype> = weights as Weights<ReturnDtype>;
+    let current: Weights<D> = weights as Weights<D>;
     for (let i = 0; i < path.length - 1; i++) {
       if (!current[path[i]]) {
         current[path[i]] = path[i] === "layers" ? ([] as any) : {};
       }
-      current = current[path[i]] as Weights<ReturnDtype>;
+      current = current[path[i]] as Weights<D>;
     }
     current[path[path.length - 1]] = {
       ...(value as HeaderEntry),
@@ -142,18 +208,20 @@ function readSafetensors<const D extends SUPPORTED_DTYPES>(
     } as any;
   }
 
+  fs.closeSync(handle);
+
   return {
     metadata: header.__metadata__,
     weights,
+    dtype,
   };
 }
 
-function readSafetensorsIndex<const D extends SUPPORTED_DTYPES>(
+function readSafetensorsIndex<const D extends OUTPUT_DTYPE_NAMES>(
   indexFile: string,
   dtype: D,
-) {
-  type ReturnDtype = InstanceType<typeof DTYPE_MAPPING[D]>;
-
+  options: { filter?: (layer: string) => boolean } = {},
+): Safetensor<D> {
   const index: {
     metadata: Record<string, unknown>;
     weight_map: Record<string, string>;
@@ -163,7 +231,7 @@ function readSafetensorsIndex<const D extends SUPPORTED_DTYPES>(
   );
 
   let metadata = index.metadata;
-  const weights: RecursiveWeights<ReturnDtype> = {};
+  const weights: RecursiveWeights<D> = {};
   for (const file of files) {
     const filePath = path.dirname(indexFile) + "/" + file;
 
@@ -171,25 +239,28 @@ function readSafetensorsIndex<const D extends SUPPORTED_DTYPES>(
     const header = readSTHeader(handle);
 
     for (const [key, value] of Object.entries(header)) {
-      console.log("reading", key, value.shape);
       if (key === "__metadata__") {
         metadata = { ...metadata, ...value };
         continue;
       }
+      if (options.filter && !options.filter(key)) {
+        continue;
+      }
+      console.log("reading", key, value.shape, dtype);
       const dataRaw = readSTWeights(
         handle,
         header.__metadata__.headerLength,
         value as HeaderEntry,
       );
-      const data = new DTYPE_MAPPING[dtype](dataRaw);
+      const data = OUTPUT_DTYPE_MAPPING[dtype](dataRaw);
 
       const path = key.split(".");
-      let current: Weights<ReturnDtype> = weights as Weights<ReturnDtype>;
+      let current: Weights<D> = weights as Weights<D>;
       for (let i = 0; i < path.length - 1; i++) {
         if (!current[path[i]]) {
           current[path[i]] = path[i] === "layers" ? ([] as any) : {};
         }
-        current = current[path[i]] as Weights<ReturnDtype>;
+        current = current[path[i]] as Weights<D>;
       }
       current[path[path.length - 1]] = {
         ...(value as HeaderEntry),
@@ -200,20 +271,23 @@ function readSafetensorsIndex<const D extends SUPPORTED_DTYPES>(
   return {
     metadata: metadata,
     weights,
+    dtype,
   };
 }
 
-export type TransformersModel<D extends ArrayBufferLike> = {
+export type TransformersModel<D extends OUTPUT_DTYPE_NAMES> = {
   config: Record<string, unknown>;
   metadata: Record<string, string>;
   weights: RecursiveWeights<D>;
+  dtype: D;
 };
 
-export function readHFRepo<const D extends SUPPORTED_DTYPES>(
+export function readHFRepo<const D extends OUTPUT_DTYPE_NAMES>(
   configPath: string,
   modelPath: string,
   dtype: D,
-): TransformersModel<InstanceType<typeof DTYPE_MAPPING[D]>> {
+  options: { filter?: (layer: string) => boolean } = {},
+): TransformersModel<D> {
   const config = JSON.parse(fs.readFileSync(configPath, { encoding: "utf-8" }));
   const indexFile = modelPath.endsWith(".index.json")
     ? modelPath
@@ -221,15 +295,13 @@ export function readHFRepo<const D extends SUPPORTED_DTYPES>(
     ? modelPath + ".index.json"
     : "";
   if (indexFile) {
-    const model = readSafetensorsIndex(indexFile, dtype);
-    return { config, ...model } as TransformersModel<
-      InstanceType<typeof DTYPE_MAPPING[D]>
-    >;
+    const model = readSafetensorsIndex(indexFile, dtype, options);
+    if (dtype === "Q8_0") model.metadata.group_size = DEFAULT_GROUP_SIZE;
+    return { config, ...model } as TransformersModel<D>;
   }
-  const model = readSafetensors(modelPath, dtype);
-  return { config, ...model } as TransformersModel<
-    InstanceType<typeof DTYPE_MAPPING[D]>
-  >;
+  const model = readSafetensors(modelPath, dtype, options);
+  if (dtype === "Q8_0") model.metadata.group_size = DEFAULT_GROUP_SIZE;
+  return { config, ...model } as TransformersModel<D>;
 }
 
 export function fp16ToF32(input: Uint8Array) {
@@ -337,12 +409,17 @@ function nf4tof32Single(val: number) {
   }
 }
 
-export function permuteReverse(
-  w: Float32Array,
+export function permuteReverse<W extends Float32Array | Q8Array>(
+  win: W,
   n_heads: number,
   dim1: number,
   dim2: number,
-): typeof w {
+): W {
+  const isQ8 = win instanceof Q8Array;
+  const w = isQ8
+    ? q8ArrayToFloat32Array(win, win.q.length / win.s.length) as Float32Array
+    : win as Float32Array;
+
   const newShape = [n_heads, 2, Math.floor(dim1 / n_heads / 2), dim2];
 
   // Reshape w into newShape
@@ -390,5 +467,8 @@ export function permuteReverse(
     result[i] = flattened[i];
   }
 
-  return result;
+  if (isQ8) {
+    return newQ8ArrayFrom(result, win.gs) as W;
+  }
+  return result as W;
 }

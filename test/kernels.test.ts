@@ -4,10 +4,12 @@ import {
   argmax,
   elemmul,
   matmul,
+  qmatmul,
   rmsnorm,
   silu,
   softmax,
 } from "../src/kernels.ts";
+import { newQ8Array, quantize } from "../src/quantization.ts";
 
 Deno.test("accum test", () => {
   const a = new Float32Array([1, 2, 3]);
@@ -55,12 +57,12 @@ Deno.test("silu test", () => {
 
 Deno.test("matmul test", () => {
   const o = new Float32Array(2);
-  const x = new Float32Array([1, 2, 3]);
-  const w = new Float32Array([1, 2, 3, 4, 5, 6]);
-  const n = 3;
+  const x = new Float32Array([1, 2, 3, 4]);
+  const w = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8]);
+  const n = 4;
   const d = 2;
   matmul(o, x, w, n, d);
-  assertEquals(o, new Float32Array([14, 32]));
+  assertEquals(o, new Float32Array([30, 70]));
 });
 
 Deno.test("softmax test", () => {
@@ -79,4 +81,17 @@ Deno.test("softmax test", () => {
 Deno.test("argmax test", () => {
   const x = new Float32Array([1, 2, 3]);
   assertEquals(argmax(x, 3), 2);
+});
+
+Deno.test("qmatmul test", () => {
+  const gs = 4;
+  const o = new Float32Array(2);
+  const x_q = newQ8Array(4, gs);
+  quantize(x_q, new Float32Array([1, 2, 3, 4]), 4, gs);
+  const w_q = newQ8Array(8, gs);
+  quantize(w_q, new Float32Array([1, 2, 3, 4, 5, 6, 7, 8]), 8, gs);
+  const n = 4;
+  const d = 2;
+  qmatmul(o, x_q, w_q, n, d, gs);
+  assertEquals(o, new Float32Array([30.03186798095703, 69.99962615966797]));
 });
