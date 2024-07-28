@@ -5,9 +5,7 @@
   "main": "llama2.ts",
   "type": "module",
   "scripts": {
-    "demo-node": "node --experimental-loader=./t348.mjs llama2.ts stories15M.bin -i \"Once upon a time\"",
-    "demo-deno": "deno llama2.ts stories15M.bin -i \"Once upon a time\"",
-    "deterministic": "node --experimental-loader=./t348.mjs llama2.ts stories15M.bin -s 1 -t 0 -i \"Once upon a time\""
+    "start": "deno run --allow-all ./src/llama2.ts ./tinyllama-15M/ -t 0 -s 1 -i \"Once upon a time\""
   },
   "keywords": [
     "llama2",

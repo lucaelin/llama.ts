@@ -1,25 +1,27 @@
 import { argmax, softmax } from "./kernels.ts";
 import { random_f32 } from "./rng.ts";
+import { F32Tensor } from "./types.ts";
 
 type float = number;
 
 export function sample(
-  logits: Float32Array,
+  logits_t: F32Tensor,
   vocab_size: number,
   temperature: number,
   topp: number,
 ) {
+  const logits = logits_t.array;
   // sample the token given the logits and some hyperparameters
   if (temperature == 0.0) {
     // greedy argmax sampling: take the token with the highest probability
-    return argmax(logits, vocab_size);
+    return argmax(logits_t, vocab_size);
   } else {
     // apply the temperature to the logits
     for (let q = 0; q < vocab_size; q++) {
       logits[q] /= temperature;
     }
     // apply softmax to the logits to get the probabilities for next token
-    softmax(logits, vocab_size);
+    softmax(logits_t, vocab_size);
     const coin = random_f32();
     // we sample from this distribution to get the next token
     if (topp <= 0 || topp >= 1) {

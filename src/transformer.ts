@@ -1,14 +1,18 @@
 import { matmul, matmuladd, softmax } from "./kernels.ts";
+import { F32Tensor } from "./types.ts";
 
 export function rope(
-  q: Float32Array,
-  k: Float32Array,
+  q_t: F32Tensor,
+  k_t: F32Tensor,
   pos: number,
   dim: number,
   kv_dim: number,
   head_size: number,
   theta: number,
 ): void {
+  const q = q_t.array;
+  const k = k_t.array;
+
   // RoPE relative positional encoding: complex-valued rotate q and k
   //console.log('RoPE');
   for (let i = 0; i < dim; i += 2) {
@@ -33,17 +37,22 @@ export function rope(
 }
 
 export function mutlihead_attention(
-  xb: Float32Array,
-  q: Float32Array,
-  key_cache_layer: Float32Array,
-  value_cache_layer: Float32Array,
-  att: Float32Array,
+  xb_t: F32Tensor,
+  q_t: F32Tensor,
+  key_cache_layer_t: F32Tensor,
+  value_cache_layer_t: F32Tensor,
+  att_t: F32Tensor,
   pos: number,
   seq_len: number,
   dim: number,
   n_heads: number,
   n_kv_heads: number,
 ) {
+  const xb = xb_t.array;
+  const q = q_t.array;
+  const key_cache_layer = key_cache_layer_t.array;
+  const value_cache_layer = value_cache_layer_t.array;
+
   const head_size = dim / n_heads;
   const kv_dim = (dim * n_kv_heads) / n_heads;
   const kv_mul = n_heads / n_kv_heads; // integer multiplier of the kv sharing in multiquery
@@ -51,7 +60,8 @@ export function mutlihead_attention(
   //console.log("Multi-Headed Attention");
   for (let h = 0; h < n_heads; h++) {
     const q_head = q.subarray(h * head_size, h * head_size + head_size);
-    const att_head = att.subarray(h * seq_len, h * seq_len + seq_len);
+    const att_head_t = att_t.subarray(h * seq_len, h * seq_len + seq_len);
+    const att_head = att_head_t.array;
 
     // iterate over all timesteps, including the current one
     for (let t = 0; t <= pos; t++) {
@@ -67,7 +77,7 @@ export function mutlihead_attention(
       att_head[t] = score / Math.sqrt(head_size);
     }
 
-    softmax(att_head, pos + 1);
+    softmax(att_head_t, pos + 1);
 
     // weighted sum of the values, store back into xb
     const xb_head = xb.subarray(h * head_size, h * head_size + head_size);
@@ -86,11 +96,11 @@ export function mutlihead_attention(
 }
 
 export function lora(
-  x_out: Float32Array,
-  x: Float32Array,
-  x_r: Float32Array,
-  w_a: Float32Array,
-  w_b: Float32Array,
+  x_out: F32Tensor,
+  x: F32Tensor,
+  x_r: F32Tensor,
+  w_a: F32Tensor,
+  w_b: F32Tensor,
   n: number,
   d: number,
   rank: number,

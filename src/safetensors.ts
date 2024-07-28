@@ -1,13 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Buffer } from "node:buffer";
-import {
-  DEFAULT_GROUP_SIZE,
-  dequantize,
-  newQ8ArrayFrom,
-  Q8Array,
-  q8ArrayToFloat32Array,
-} from "./quantization.ts";
+import { F32Tensor, JSF32Tensor, JSQ8Tensor, Q8Tensor } from "./types.ts";
+import { WasmF32Tensor, WasmQ8Tensor } from "./types_wasm.ts";
 
 function raise(message: string): never {
   throw new Error(message);
@@ -69,14 +64,32 @@ const DTYPE_MAPPING = {
 
 const OUTPUT_DTYPE_MAPPING = {
   "F32": (buffer: ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>) =>
-    new Float32Array(buffer),
+    new JSF32Tensor(new Float32Array(buffer as any)),
   "Q8_0": (buffer: ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>) =>
-    newQ8ArrayFrom(
-      buffer instanceof Float32Array ? buffer : new Float32Array(buffer),
-      DEFAULT_GROUP_SIZE,
+    JSQ8Tensor.allocateFromF32(
+      new JSF32Tensor(
+        buffer instanceof Float32Array
+          ? buffer
+          : new Float32Array(buffer as any),
+      ),
+      JSQ8Tensor.DEFAULT_GROUP_SIZE,
+    ),
+  "WASM_F32": (
+    buffer: ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>,
+  ) => WasmF32Tensor.moveFrom(new Float32Array(buffer as any)),
+  "WASM_Q8_0": (
+    buffer: ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>,
+  ) =>
+    WasmQ8Tensor.allocateFromJSF32(
+      new JSF32Tensor(
+        buffer instanceof Float32Array
+          ? buffer
+          : new Float32Array(buffer as any),
+      ),
+      JSQ8Tensor.DEFAULT_GROUP_SIZE,
     ),
   "raw": (buffer: ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>) =>
-    new Uint8Array(buffer.buffer, 0, buffer.byteLength),
+    new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength),
   "unknown": (
     buffer: ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>,
   ) => buffer,
@@ -296,11 +309,15 @@ export function readHFRepo<const D extends OUTPUT_DTYPE_NAMES>(
     : "";
   if (indexFile) {
     const model = readSafetensorsIndex(indexFile, dtype, options);
-    if (dtype === "Q8_0") model.metadata.group_size = DEFAULT_GROUP_SIZE;
+    if (dtype === "Q8_0") {
+      model.metadata.group_size = JSQ8Tensor.DEFAULT_GROUP_SIZE;
+    }
     return { config, ...model } as TransformersModel<D>;
   }
   const model = readSafetensors(modelPath, dtype, options);
-  if (dtype === "Q8_0") model.metadata.group_size = DEFAULT_GROUP_SIZE;
+  if (dtype === "Q8_0") {
+    model.metadata.group_size = JSQ8Tensor.DEFAULT_GROUP_SIZE;
+  }
   return { config, ...model } as TransformersModel<D>;
 }
 
@@ -409,16 +426,16 @@ function nf4tof32Single(val: number) {
   }
 }
 
-export function permuteReverse<W extends Float32Array | Q8Array>(
+export function permuteReverse<W extends F32Tensor | Q8Tensor>(
   win: W,
   n_heads: number,
   dim1: number,
   dim2: number,
 ): W {
-  const isQ8 = win instanceof Q8Array;
-  const w = isQ8
-    ? q8ArrayToFloat32Array(win, win.q.length / win.s.length) as Float32Array
-    : win as Float32Array;
+  const isQ8 = win instanceof JSQ8Tensor || win instanceof WasmQ8Tensor;
+  const w: Float32Array = isQ8
+    ? (win as JSQ8Tensor).dequantize()
+    : (win as F32Tensor).array;
 
   const newShape = [n_heads, 2, Math.floor(dim1 / n_heads / 2), dim2];
 
@@ -462,13 +479,14 @@ export function permuteReverse<W extends Float32Array | Q8Array>(
     }
   }
 
-  const result = new Float32Array(dim1 * dim2);
+  const result_t = WasmF32Tensor.allocate(dim1 * dim2);
+  const result = result_t.array;
   for (let i = 0; i < result.length; i++) {
     result[i] = flattened[i];
   }
 
   if (isQ8) {
-    return newQ8ArrayFrom(result, win.gs) as W;
+    return WasmQ8Tensor.allocateFromF32(result_t, win.gs) as unknown as W;
   }
-  return result as W;
+  return WasmF32Tensor.moveFrom(result) as unknown as W;
 }
