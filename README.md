@@ -17,6 +17,7 @@ Based on the Andrej Karpathy's [llama2.c].
 deno:
 ```sh
 git clone https://huggingface.co/nickypro/tinyllama-15M
+cd src/wasm && make all    # requires emcc
 deno run --allow-all llama2.ts ./tinyllama-15M -s 1 -t 0 -i "Once upon a time"
 ```
 
