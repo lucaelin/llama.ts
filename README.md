@@ -2,6 +2,7 @@
 PoC and educational inference for [Llama2]-like Transformer models (phi, gemma, tinyllama, etc) in TypeScript
 
 Based on Oleksandr Nikitin's llama2.ts: https://github.com/wizzard0/llama2.ts
+
 Based on the Andrej Karpathy's [llama2.c].
 
 ### Features
