@@ -5,34 +5,55 @@ export function rope(
   q_t: F32Tensor,
   k_t: F32Tensor,
   pos: number,
-  dim: number,
-  kv_dim: number,
+  num_heads: number,
+  num_kv_heads: number,
   head_size: number,
   theta: number,
 ): void {
   const q = q_t.array;
   const k = k_t.array;
+  /*
+      for (int i = 0; i < p->n_heads; i++) {
+	        for (int j = 0; j < head_size; j += 2) {
+	            float freq = 1.0f / powf(500000.0f, (float)j / (float)head_size);
+	            float val = pos * freq;
+	            float fcr = cosf(val);
+	            float fci = sinf(val);
+	            float q0 = s->q[i * head_size + j];
+	            float q1 = s->q[i * head_size + j + 1];
+	            s->q[i * head_size + j] = q0 * fcr - q1 * fci;
+	            s->q[i * head_size + j + 1] = q0 * fci + q1 * fcr;
+	            if (i < p->n_kv_heads) {
+	                float k0 = s->k[i * head_size + j];
+	                float k1 = s->k[i * head_size + j + 1];
+	                s->k[i * head_size + j] = k0 * fcr - k1 * fci;
+	                s->k[i * head_size + j + 1] = k0 * fci + k1 * fcr;
+	            }
+	        }
+	    }
+    */
 
   // RoPE relative positional encoding: complex-valued rotate q and k
   //console.log('RoPE');
-  for (let i = 0; i < dim; i += 2) {
-    const head_dim = i % head_size;
-    const freq = 1.0 / Math.pow(theta, head_dim / head_size);
-    const val = pos * freq;
-    const fcr = Math.cos(val);
-    const fci = Math.sin(val);
+  for (let i = 0; i < num_heads; i++) {
+    for (let j = 0; j < head_size; j += 2) {
+      const freq = 1.0 / Math.pow(theta, j / head_size);
+      const val = pos * freq;
+      const fcr = Math.cos(val);
+      const fci = Math.sin(val);
 
-    if (i < kv_dim) {
-      const v0 = k[i];
-      const v1 = k[i + 1];
-      k[i] = v0 * fcr - v1 * fci;
-      k[i + 1] = v0 * fci + v1 * fcr;
+      if (i < num_kv_heads) {
+        const k0 = k[i * head_size + j];
+        const k1 = k[i * head_size + j + 1];
+        k[i * head_size + j] = k0 * fcr - k1 * fci;
+        k[i * head_size + j + 1] = k0 * fci + k1 * fcr;
+      }
+
+      const q0 = q[i * head_size + j];
+      const q1 = q[i * head_size + j + 1];
+      q[i * head_size + j] = q0 * fcr - q1 * fci;
+      q[i * head_size + j + 1] = q0 * fci + q1 * fcr;
     }
-
-    const v0 = q[i];
-    const v1 = q[i + 1];
-    q[i] = v0 * fcr - v1 * fci;
-    q[i + 1] = v0 * fci + v1 * fcr;
   }
 }
 
@@ -74,8 +95,15 @@ export function mutlihead_attention(
       let score = 0.0;
       for (let i = 0; i < head_size; i++) score += q_head[i] * k[i];
       // save the score to the attention buffer
-      att_head[t] = score / Math.sqrt(head_size);
+      att_head[t] = score / Math.sqrt(head_size); // gemma2: config.query_pre_attn_scalar**-0.5
     }
+
+    // gemma2 softcap
+    //if ( model_type==="gemma2" ) {
+    //  attn_weights = attn_weights / self.config.attn_logit_softcapping
+    //  attn_weights = torch.tanh(attn_weights)
+    //  attn_weights = attn_weights * self.config.attn_logit_softcapping
+    //}
 
     softmax(att_head_t, pos + 1);
 

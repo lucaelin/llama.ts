@@ -31,7 +31,7 @@ Deno.test("rmsnorm test", () => {
   const o = JSF32Tensor.allocate(3);
   const x = JSF32Tensor.allocateFrom([1, 2, 1]);
   const weight = JSF32Tensor.allocateFrom([1, 1, 2]);
-  rmsnorm(o, x, weight, 3);
+  rmsnorm(o, x, weight, 3, 0);
   //const res = Math.sqrt(2);
   //assertEquals(o, new Float32Array([res / 2, res, res]));
   assertEquals(

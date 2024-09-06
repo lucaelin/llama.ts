@@ -1,8 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Buffer } from "node:buffer";
-import { F32Tensor, JSF32Tensor, JSQ8Tensor, Q8Tensor } from "./types.ts";
-import { WasmF32Tensor, WasmQ8Tensor } from "./types_wasm.ts";
+import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
 
 function raise(message: string): never {
   throw new Error(message);
@@ -58,47 +57,22 @@ const DTYPE_MAPPING = {
       0,
       buffer.byteLength / Uint8Array.BYTES_PER_ELEMENT,
     ),
-  BOOL: (buffer: Uint8Array, offset?: number, length?: number) =>
-    new Uint8Array(buffer.buffer, offset, length),
-};
+  Q8_0: (buffer: Uint8Array, entry: HeaderEntry) => {
+    const gs = entry.group_size ?? raise("No group size");
+    const groups = buffer.byteLength /
+      (gs + Float32Array.BYTES_PER_ELEMENT);
+    const qlength = groups * gs;
+    const q = new Int8Array(buffer.buffer, 0, qlength);
+    const s = new Float32Array(buffer.buffer, qlength);
 
-const OUTPUT_DTYPE_MAPPING = {
-  "F32": (buffer: ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>) =>
-    new JSF32Tensor(new Float32Array(buffer as any)),
-  "Q8_0": (buffer: ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>) =>
-    JSQ8Tensor.allocateFromF32(
-      new JSF32Tensor(
-        buffer instanceof Float32Array
-          ? buffer
-          : new Float32Array(buffer as any),
-      ),
-      JSQ8Tensor.DEFAULT_GROUP_SIZE,
-    ),
-  "WASM_F32": (
-    buffer: ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>,
-  ) => WasmF32Tensor.moveFrom(new Float32Array(buffer as any)),
-  "WASM_Q8_0": (
-    buffer: ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>,
-  ) =>
-    WasmQ8Tensor.allocateFromJSF32(
-      new JSF32Tensor(
-        buffer instanceof Float32Array
-          ? buffer
-          : new Float32Array(buffer as any),
-      ),
-      JSQ8Tensor.DEFAULT_GROUP_SIZE,
-    ),
-  "raw": (buffer: ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>) =>
-    new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength),
-  "unknown": (
-    buffer: ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>,
-  ) => buffer,
+    return { q, s };
+  },
 };
 
 type SUPPORTED_DTYPE_NAMES = keyof typeof DTYPE_MAPPING;
-type SUPPORTED_DTYPES = ReturnType<typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]>;
-
-type OUTPUT_DTYPE_NAMES = keyof typeof OUTPUT_DTYPE_MAPPING;
+export type SUPPORTED_DTYPES = ReturnType<
+  typeof DTYPE_MAPPING[SUPPORTED_DTYPE_NAMES]
+>;
 
 type FileHandle = number & { [Symbol.toStringTag]: "FileHandle" };
 
@@ -113,10 +87,11 @@ type HeaderEntry = {
     | "I16"
     | "I8"
     | "U8"
-    | "BOOL";
+    | "Q8_0";
   shape: number[];
   offsets?: [number, number];
   data_offsets?: [number, number];
+  group_size?: number;
 };
 type Header = {
   [key: string]: HeaderEntry;
@@ -127,16 +102,16 @@ type Header = {
   };
 };
 
-type WeightsEntry<D extends OUTPUT_DTYPE_NAMES> = HeaderEntry & {
-  weights: ReturnType<typeof OUTPUT_DTYPE_MAPPING[D]>;
+export type WeightsEntry<D extends SUPPORTED_DTYPE_NAMES> = HeaderEntry & {
+  weights: ReturnType<typeof DTYPE_MAPPING[D]>;
 };
-interface RecursiveWeights<D extends OUTPUT_DTYPE_NAMES> {
-  [key: string]: Weights<D>;
+interface RecursiveWeights {
+  [key: string]: Weights;
 }
-type Weights<D extends OUTPUT_DTYPE_NAMES> =
-  & RecursiveWeights<D>
-  & { weight: WeightsEntry<D> }
-  & { layers: RecursiveWeights<D>[] };
+type Weights =
+  & RecursiveWeights
+  & { weight: WeightsEntry<SUPPORTED_DTYPE_NAMES> }
+  & { layers: RecursiveWeights[] };
 
 function readSTHeader(handle: FileHandle): Header {
   const prefixBytes = new Uint8Array(8);
@@ -173,24 +148,22 @@ function readSTWeights(
   if (entry.dtype === "BF16") {
     return bf16ToF32(new Uint8Array(dataRaw));
   }
-  return intype(dataRaw);
+  return intype(dataRaw, entry);
 }
 
-type Safetensor<D extends OUTPUT_DTYPE_NAMES> = {
+type Safetensor = {
   metadata: Record<string, unknown>;
-  weights: RecursiveWeights<D>;
-  dtype: D;
+  weights: RecursiveWeights;
 };
 
-function readSafetensors<const D extends OUTPUT_DTYPE_NAMES>(
+function readSafetensors(
   path: string,
-  dtype: D,
   options: { filter?: (layer: string) => boolean } = {},
-): Safetensor<D> {
+): Safetensor {
   const handle = fs.openSync(path, "r") as FileHandle;
   const header = readSTHeader(handle);
 
-  const weights: RecursiveWeights<D> = {};
+  const weights: RecursiveWeights = {};
 
   for (const [key, value] of Object.entries(header)) {
     if (key === "__metadata__") {
@@ -199,21 +172,20 @@ function readSafetensors<const D extends OUTPUT_DTYPE_NAMES>(
     if (options.filter && !options.filter(key)) {
       continue;
     }
-    console.log("reading", key, value.shape, dtype);
-    const dataRaw = readSTWeights(
+    console.log("reading", key, value.shape);
+    const data = readSTWeights(
       handle,
       header.__metadata__.headerLength,
       value as HeaderEntry,
     );
-    const data = OUTPUT_DTYPE_MAPPING[dtype](dataRaw);
 
     const path = key.split(".");
-    let current: Weights<D> = weights as Weights<D>;
+    let current: Weights = weights as Weights;
     for (let i = 0; i < path.length - 1; i++) {
       if (!current[path[i]]) {
         current[path[i]] = path[i] === "layers" ? ([] as any) : {};
       }
-      current = current[path[i]] as Weights<D>;
+      current = current[path[i]] as Weights;
     }
     current[path[path.length - 1]] = {
       ...(value as HeaderEntry),
@@ -226,15 +198,13 @@ function readSafetensors<const D extends OUTPUT_DTYPE_NAMES>(
   return {
     metadata: header.__metadata__,
     weights,
-    dtype,
   };
 }
 
-function readSafetensorsIndex<const D extends OUTPUT_DTYPE_NAMES>(
+function readSafetensorsIndex(
   indexFile: string,
-  dtype: D,
   options: { filter?: (layer: string) => boolean } = {},
-): Safetensor<D> {
+): Safetensor {
   const index: {
     metadata: Record<string, unknown>;
     weight_map: Record<string, string>;
@@ -244,7 +214,7 @@ function readSafetensorsIndex<const D extends OUTPUT_DTYPE_NAMES>(
   );
 
   let metadata = index.metadata;
-  const weights: RecursiveWeights<D> = {};
+  const weights: RecursiveWeights = {};
   for (const file of files) {
     const filePath = path.dirname(indexFile) + "/" + file;
 
@@ -259,21 +229,20 @@ function readSafetensorsIndex<const D extends OUTPUT_DTYPE_NAMES>(
       if (options.filter && !options.filter(key)) {
         continue;
       }
-      console.log("reading", key, value.shape, dtype);
-      const dataRaw = readSTWeights(
+      console.log("reading", key, value.shape);
+      const data = readSTWeights(
         handle,
         header.__metadata__.headerLength,
         value as HeaderEntry,
       );
-      const data = OUTPUT_DTYPE_MAPPING[dtype](dataRaw);
 
       const path = key.split(".");
-      let current: Weights<D> = weights as Weights<D>;
+      let current: Weights = weights as Weights;
       for (let i = 0; i < path.length - 1; i++) {
         if (!current[path[i]]) {
           current[path[i]] = path[i] === "layers" ? ([] as any) : {};
         }
-        current = current[path[i]] as Weights<D>;
+        current = current[path[i]] as Weights;
       }
       current[path[path.length - 1]] = {
         ...(value as HeaderEntry),
@@ -284,23 +253,20 @@ function readSafetensorsIndex<const D extends OUTPUT_DTYPE_NAMES>(
   return {
     metadata: metadata,
     weights,
-    dtype,
   };
 }
 
-export type TransformersModel<D extends OUTPUT_DTYPE_NAMES> = {
+export type TransformersModel = {
   config: Record<string, unknown>;
   metadata: Record<string, string>;
-  weights: RecursiveWeights<D>;
-  dtype: D;
+  weights: RecursiveWeights;
 };
 
-export function readHFRepo<const D extends OUTPUT_DTYPE_NAMES>(
+export function readHFRepo(
   configPath: string,
   modelPath: string,
-  dtype: D,
   options: { filter?: (layer: string) => boolean } = {},
-): TransformersModel<D> {
+): TransformersModel {
   const config = JSON.parse(fs.readFileSync(configPath, { encoding: "utf-8" }));
   const indexFile = modelPath.endsWith(".index.json")
     ? modelPath
@@ -308,17 +274,181 @@ export function readHFRepo<const D extends OUTPUT_DTYPE_NAMES>(
     ? modelPath + ".index.json"
     : "";
   if (indexFile) {
-    const model = readSafetensorsIndex(indexFile, dtype, options);
-    if (dtype === "Q8_0") {
-      model.metadata.group_size = JSQ8Tensor.DEFAULT_GROUP_SIZE;
+    const model = readSafetensorsIndex(indexFile, options);
+    return { config, ...model } as TransformersModel;
+  }
+  const model = readSafetensors(modelPath, options);
+  return { config, ...model } as TransformersModel;
+}
+
+function flattenWeightsToSafetensors(
+  weights: RecursiveWeights,
+  flattenedWeights: {
+    [key: string]: WeightsEntry<SUPPORTED_DTYPE_NAMES>;
+  } = {},
+  prefix = "",
+): { [key: string]: WeightsEntry<SUPPORTED_DTYPE_NAMES> } {
+  for (const [key, value] of Object.entries(weights)) {
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) {
+        flattenWeightsToSafetensors(
+          value[i] as RecursiveWeights,
+          flattenedWeights,
+          `${prefix}${key}.${i}.`,
+        );
+      }
+    } else {
+      if (key === "weight") {
+        flattenedWeights[`${prefix}${key}`] = value as any;
+      } else if (typeof value === "object") {
+        flattenWeightsToSafetensors(
+          value as RecursiveWeights,
+          flattenedWeights,
+          `${prefix}${key}.`,
+        );
+      }
     }
-    return { config, ...model } as TransformersModel<D>;
   }
-  const model = readSafetensors(modelPath, dtype, options);
-  if (dtype === "Q8_0") {
-    model.metadata.group_size = JSQ8Tensor.DEFAULT_GROUP_SIZE;
+  return flattenedWeights;
+}
+
+Deno.test("flattenWeightsToSafetensors", () => {
+  const weights = {
+    model: {
+      layers: [
+        {
+          test: {
+            weight: {
+              dtype: "F32",
+              shape: [2, 2],
+              weights: new Float32Array([1, 2, 3, 4]),
+              data_offsets: [0, 16],
+            },
+          },
+          test2: {
+            weight: {
+              dtype: "Q8_0",
+              shape: [2, 2],
+              group_size: 2,
+              weights: {
+                q: new Int8Array([1, 2, 3, 4]),
+                s: new Float32Array([1, 2]),
+              },
+              data_offsets: [0, 16],
+            },
+          },
+        },
+      ],
+    },
+  };
+  const flattenedWeights = flattenWeightsToSafetensors(weights as any);
+  assertEquals(flattenedWeights, {
+    "model.layers.0.test.weight": {
+      dtype: "F32",
+      shape: [2, 2],
+      weights: new Float32Array([1, 2, 3, 4]),
+      data_offsets: [0, 16],
+    },
+    "model.layers.0.test2.weight": {
+      dtype: "Q8_0",
+      shape: [2, 2],
+      group_size: 2,
+      weights: {
+        q: new Int8Array([1, 2, 3, 4]),
+        s: new Float32Array([1, 2]),
+      },
+      data_offsets: [0, 16],
+    },
+  });
+});
+
+export async function writeSafetensors(
+  model: TransformersModel,
+  configPath: string,
+  modelPath: string,
+) {
+  const flattenedWeights = flattenWeightsToSafetensors(model.weights);
+  let dataoffset = 0;
+  const layerHeader = {
+    "__metadata__": model.metadata,
+    ...Object.fromEntries(
+      Object.entries(flattenedWeights).map(([key, value]) => {
+        const { dtype, shape, weights } = value;
+        const start = dataoffset;
+        let group_size = undefined;
+        if ("q" in weights) {
+          dataoffset = start + weights.q.byteLength + weights.s.byteLength;
+          group_size = weights.q.length / weights.s.length;
+        } else {
+          dataoffset = start + weights.byteLength;
+        }
+
+        return [key, {
+          dtype,
+          shape,
+          data_offsets: [start, dataoffset],
+          group_size,
+        }];
+      }),
+    ),
+  };
+
+  const header = new TextEncoder().encode(JSON.stringify(layerHeader));
+  const headerSize = new Uint8Array(8);
+  const headerView = new DataView(headerSize.buffer);
+  headerView.setBigUint64(0, BigInt(header.byteLength), true);
+
+  const filecontents: Uint8Array[] = [
+    headerSize,
+    header,
+    ...Object.values(flattenedWeights).map((w) => {
+      if (
+        "q" in w.weights && "s" in w.weights
+      ) {
+        const q = w.weights.q;
+        const s = w.weights.s;
+        const buffer = new Uint8Array(
+          w.weights.q.byteLength + w.weights.s.byteLength,
+        );
+        buffer.set(q);
+        buffer.set(
+          new Uint8Array(s.buffer, s.byteOffset, s.byteLength),
+          q.byteLength,
+        );
+        return buffer;
+      }
+
+      const buffer = new Uint8Array(w.weights.byteLength);
+      buffer.set(
+        new Uint8Array(
+          w.weights.buffer,
+          w.weights.byteOffset,
+          w.weights.byteLength,
+        ),
+      );
+      return buffer;
+    }),
+  ];
+
+  const configFileHandle = await Deno.open(configPath, {
+    create: true,
+    write: true,
+  });
+  const modelFileHandle = await Deno.open(modelPath, {
+    create: true,
+    write: true,
+  });
+  await configFileHandle.write(
+    new TextEncoder().encode(JSON.stringify(model.config)),
+  );
+  for (const filecontent of filecontents) {
+    let written = 0;
+    while (written < filecontent.byteLength) {
+      written += await modelFileHandle.write(filecontent.subarray(written));
+    }
   }
-  return { config, ...model } as TransformersModel<D>;
+  configFileHandle.close();
+  modelFileHandle.close();
 }
 
 export function fp16ToF32(input: Uint8Array) {
@@ -426,67 +556,12 @@ function nf4tof32Single(val: number) {
   }
 }
 
-export function permuteReverse<W extends F32Tensor | Q8Tensor>(
-  win: W,
-  n_heads: number,
-  dim1: number,
-  dim2: number,
-): W {
-  const isQ8 = win instanceof JSQ8Tensor || win instanceof WasmQ8Tensor;
-  const w: Float32Array = isQ8
-    ? (win as JSQ8Tensor).dequantize()
-    : (win as F32Tensor).array;
-
-  const newShape = [n_heads, 2, Math.floor(dim1 / n_heads / 2), dim2];
-
-  // Reshape w into newShape
-  const reshaped: number[][][][] = [];
-  let index = 0;
-  for (let i = 0; i < newShape[0]; i++) {
-    reshaped[i] = [];
-    for (let j = 0; j < newShape[1]; j++) {
-      reshaped[i][j] = [];
-      for (let k = 0; k < newShape[2]; k++) {
-        reshaped[i][j][k] = [];
-        for (let l = 0; l < newShape[3]; l++) {
-          reshaped[i][j][k][l] = w[index++];
-        }
-      }
-    }
+export function dequantize(
+  o: Float32Array,
+  x: { q: Int8Array; s: Float32Array },
+  n: number,
+): void {
+  for (let i = 0; i < n; i++) {
+    o[i] = x.q[i] * x.s[Math.floor(i / (x.q.length / x.s.length))];
   }
-
-  // Transpose (1, 2) => (0, 2, 1, 3)
-  const transposed: number[][][][] = [];
-  for (let i = 0; i < newShape[0]; i++) {
-    transposed[i] = [];
-    for (let k = 0; k < newShape[2]; k++) {
-      transposed[i][k] = [];
-      for (let j = 0; j < newShape[1]; j++) {
-        transposed[i][k][j] = reshaped[i][j][k];
-      }
-    }
-  }
-
-  // Flatten the transposed array and reshape it into [dim1, dim2]
-  const flattened: number[] = [];
-  for (let i = 0; i < newShape[0]; i++) {
-    for (let k = 0; k < newShape[2]; k++) {
-      for (let j = 0; j < newShape[1]; j++) {
-        for (let l = 0; l < newShape[3]; l++) {
-          flattened.push(transposed[i][k][j][l]);
-        }
-      }
-    }
-  }
-
-  const result_t = WasmF32Tensor.allocate(dim1 * dim2);
-  const result = result_t.array;
-  for (let i = 0; i < result.length; i++) {
-    result[i] = flattened[i];
-  }
-
-  if (isQ8) {
-    return WasmQ8Tensor.allocateFromF32(result_t, win.gs) as unknown as W;
-  }
-  return WasmF32Tensor.moveFrom(result) as unknown as W;
 }

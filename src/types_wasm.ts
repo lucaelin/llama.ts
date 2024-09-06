@@ -57,7 +57,7 @@ export class WasmF32Tensor extends WasmTensor implements F32Tensor {
   }
 
   constructor(
-    public bytelength: number,
+    public byteLength: number,
     public wasmAddress: number,
     public wasmMemory: WebAssembly.Memory = memory,
   ) {
@@ -71,7 +71,7 @@ export class WasmF32Tensor extends WasmTensor implements F32Tensor {
   get array() {
     return new Float32Array(this.wasmMemory.buffer).subarray(
       this.wasmAddress / Float32Array.BYTES_PER_ELEMENT,
-      (this.wasmAddress + this.bytelength) / Float32Array.BYTES_PER_ELEMENT,
+      (this.wasmAddress + this.byteLength) / Float32Array.BYTES_PER_ELEMENT,
     );
   }
 
@@ -84,7 +84,7 @@ export class WasmF32Tensor extends WasmTensor implements F32Tensor {
   }
 
   get length() {
-    return this.bytelength / Float32Array.BYTES_PER_ELEMENT;
+    return this.byteLength / Float32Array.BYTES_PER_ELEMENT;
   }
 }
 
@@ -101,7 +101,7 @@ export class WasmI8Tensor extends WasmTensor implements I8Tensor {
   }
 
   constructor(
-    public bytelength: number,
+    public byteLength: number,
     public wasmAddress: number,
     public wasmMemory: WebAssembly.Memory = memory,
   ) {
@@ -115,7 +115,7 @@ export class WasmI8Tensor extends WasmTensor implements I8Tensor {
   get array() {
     return new Int8Array(this.wasmMemory.buffer).subarray(
       this.wasmAddress / Int8Array.BYTES_PER_ELEMENT,
-      (this.wasmAddress + this.bytelength) / Int8Array.BYTES_PER_ELEMENT,
+      (this.wasmAddress + this.byteLength) / Int8Array.BYTES_PER_ELEMENT,
     );
   }
 
@@ -128,7 +128,7 @@ export class WasmI8Tensor extends WasmTensor implements I8Tensor {
   }
 
   get length() {
-    return this.bytelength / Int8Array.BYTES_PER_ELEMENT;
+    return this.byteLength / Int8Array.BYTES_PER_ELEMENT;
   }
 }
 
@@ -145,7 +145,7 @@ export class WasmU8Tensor extends WasmTensor implements U8Tensor {
   }
 
   constructor(
-    public bytelength: number,
+    public byteLength: number,
     public wasmAddress: number,
     public wasmMemory: WebAssembly.Memory = memory,
   ) {
@@ -159,7 +159,7 @@ export class WasmU8Tensor extends WasmTensor implements U8Tensor {
   get array() {
     return new Uint8Array(this.wasmMemory.buffer).subarray(
       this.wasmAddress / Uint8Array.BYTES_PER_ELEMENT,
-      (this.wasmAddress + this.bytelength) / Uint8Array.BYTES_PER_ELEMENT,
+      (this.wasmAddress + this.byteLength) / Uint8Array.BYTES_PER_ELEMENT,
     );
   }
 
@@ -172,7 +172,7 @@ export class WasmU8Tensor extends WasmTensor implements U8Tensor {
   }
 
   get length() {
-    return this.bytelength / Uint8Array.BYTES_PER_ELEMENT;
+    return this.byteLength / Uint8Array.BYTES_PER_ELEMENT;
   }
 }
 
@@ -230,6 +230,10 @@ export class WasmQ8Tensor extends WasmTensor implements Q8Tensor {
 
   get length() {
     return this.q.length;
+  }
+
+  get byteLength() {
+    return this.q.byteLength + this.s.byteLength;
   }
 
   get array(): Int8Array {

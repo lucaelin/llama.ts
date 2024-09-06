@@ -1,3 +1,4 @@
+import { group } from "node:console";
 import { dequantize, quantize } from "./kernels.ts";
 
 declare global {
@@ -16,6 +17,7 @@ export abstract class Tensor {
   abstract get array(): ArrayLike<number>;
   abstract subarray(start: number, end: number): Tensor;
   abstract length: number;
+  abstract byteLength: number;
 }
 
 export interface F32Tensor {
@@ -42,6 +44,10 @@ export class JSF32Tensor extends Tensor implements F32Tensor {
 
   get length(): number {
     return this.buffer.length;
+  }
+
+  get byteLength(): number {
+    return this.buffer.byteLength;
   }
 
   get array() {
@@ -84,6 +90,10 @@ export class JSI8Tensor extends Tensor implements I8Tensor {
     return this.buffer.length;
   }
 
+  get byteLength(): number {
+    return this.buffer.byteLength;
+  }
+
   get array() {
     return this.buffer;
   }
@@ -122,6 +132,10 @@ export class JSU8Tensor extends Tensor implements U8Tensor {
 
   get length(): number {
     return this.buffer.length;
+  }
+
+  get byteLength(): number {
+    return this.buffer.byteLength;
   }
 
   get array() {
@@ -180,6 +194,22 @@ export class JSQ8Tensor extends Tensor implements Q8Tensor {
     quantize(o, x, x.length, gs);
     return o;
   }
+  static allocateFromUint8(
+    x: Uint8Array,
+    gs: number = JSQ8Tensor.DEFAULT_GROUP_SIZE,
+  ): JSQ8Tensor {
+    const qlength = (gs * x.length) / (gs + Float32Array.BYTES_PER_ELEMENT);
+    const slength = qlength / gs;
+    const q = new JSI8Tensor(new Int8Array(x.buffer, 0, qlength));
+    const s = new JSF32Tensor(
+      new Float32Array(
+        x.buffer,
+        qlength,
+        slength * Float32Array.BYTES_PER_ELEMENT,
+      ),
+    );
+    return new JSQ8Tensor(q, s);
+  }
 
   public readonly gs: number;
   constructor(public readonly q: JSI8Tensor, public readonly s: JSF32Tensor) {
@@ -193,6 +223,17 @@ export class JSQ8Tensor extends Tensor implements Q8Tensor {
 
   public get length(): number {
     return this.q.length;
+  }
+
+  get byteLength(): number {
+    return this.q.byteLength + this.s.byteLength;
+  }
+
+  public toUint8Array(): Uint8Array {
+    const o = new Uint8Array(this.byteLength);
+    o.set(new Uint8Array(this.q.array.buffer), 0);
+    o.set(new Uint8Array(this.s.array.buffer), this.q.byteLength);
+    return o;
   }
 
   public dequantize(): Float32Array {

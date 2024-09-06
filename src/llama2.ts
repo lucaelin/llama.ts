@@ -5,96 +5,36 @@
 
 // deno-lint-ignore-file prefer-const
 
-import * as fs from "node:fs";
-import { writeAllSync } from "https://deno.land/std/io/mod.ts";
+import { writeAllSync } from "https://deno.land/std@0.224.0/io/mod.ts";
 import {
-  permuteReverse,
-  readHFRepo,
-  TransformersModel,
-} from "./safetensors.ts";
-import { accum, elemmul, quantize, rmsnorm, silu } from "./kernels.ts";
+  accum,
+  elemmul,
+  geglu,
+  gelu,
+  matmul,
+  quantize,
+  rmsnorm,
+  silu,
+} from "./kernels.ts";
 import { qmatmul } from "./kernels_wasm.ts";
 import { lora, mutlihead_attention, rope } from "./transformer.ts";
-import { decode, encode } from "./sentencepiece.ts";
+import { decode, encode, readHFRepoTokenizer } from "./sentencepiece.ts";
 import { sample } from "./sampler.ts";
 import { set_seed } from "./rng.ts";
 //import { type F32Tensor, type Q8Tensor } from "./types.ts";
 import { WasmF32Tensor, WasmQ8Tensor } from "./types_wasm.ts";
 import { JSQ8Tensor } from "./types.ts";
+import {
+  AdapterConfig,
+  AdapterWeights,
+  Config,
+  QuantizedTransformerWeights,
+  readAdapter,
+  readModel,
+} from "./model.ts";
 
 type F32Tensor = WasmF32Tensor;
 type Q8Tensor = WasmQ8Tensor;
-
-// ----------------------------------------------------------------------------
-// binary utils
-
-type float = number;
-type int = number;
-
-interface Config {
-  dim: int;
-  hidden_dim: int;
-  n_layers: int;
-  n_heads: int;
-  n_kv_heads: int;
-  vocab_size: int;
-  seq_len: int;
-  head_size: int;
-  rope_theta: float;
-  group_size: int;
-  norm_eps?: float;
-}
-
-interface TransformerWeights {
-  embed_tokens: F32Tensor;
-  input_layernorm: F32Tensor[];
-  q_proj: F32Tensor[];
-  k_proj: F32Tensor[];
-  v_proj: F32Tensor[];
-  o_proj: F32Tensor[];
-  post_attention_layernorm: F32Tensor[];
-  gate_proj: F32Tensor[];
-  down_proj: F32Tensor[];
-  up_proj: F32Tensor[];
-  norm: F32Tensor;
-  lm_head: F32Tensor;
-}
-interface QuantizedTransformerWeights {
-  embed_tokens: Q8Tensor;
-  input_layernorm: F32Tensor[];
-  q_proj: Q8Tensor[];
-  k_proj: Q8Tensor[];
-  v_proj: Q8Tensor[];
-  o_proj: Q8Tensor[];
-  post_attention_layernorm: F32Tensor[];
-  gate_proj: Q8Tensor[];
-  down_proj: Q8Tensor[];
-  up_proj: Q8Tensor[];
-  norm: F32Tensor;
-  lm_head: Q8Tensor;
-}
-
-interface AdapterConfig {
-  rank: int;
-  alpha: int;
-}
-
-interface AdapterWeights {
-  q_proj_a?: F32Tensor[];
-  q_proj_b?: F32Tensor[];
-  k_proj_a?: F32Tensor[];
-  k_proj_b?: F32Tensor[];
-  v_proj_a?: F32Tensor[];
-  v_proj_b?: F32Tensor[];
-  down_proj_a?: F32Tensor[];
-  down_proj_b?: F32Tensor[];
-  o_proj_a?: F32Tensor[];
-  o_proj_b?: F32Tensor[];
-  gate_proj_a?: F32Tensor[];
-  gate_proj_b?: F32Tensor[];
-  up_proj_a?: F32Tensor[];
-  up_proj_b?: F32Tensor[];
-}
 
 interface RunState {
   x: F32Tensor;
@@ -124,16 +64,16 @@ interface AdapterRunState {
 }
 
 function newRunState(config: Config): RunState {
-  const kv_dim = (config.dim * config.n_kv_heads) / config.n_heads;
+  const kv_dim = (config.hidden_size * config.n_kv_heads) / config.n_heads;
   const s = {} as RunState;
-  s.x = WasmF32Tensor.allocate(config.dim);
-  s.x_q = WasmQ8Tensor.allocate(config.dim, config.group_size);
-  s.xb = WasmF32Tensor.allocate(config.dim);
-  s.xb2 = WasmF32Tensor.allocate(config.dim);
-  s.hb = WasmF32Tensor.allocate(config.hidden_dim);
-  s.hb_q = WasmQ8Tensor.allocate(config.hidden_dim, config.group_size);
-  s.hb2 = WasmF32Tensor.allocate(config.hidden_dim);
-  s.q = WasmF32Tensor.allocate(config.dim);
+  s.x = WasmF32Tensor.allocate(config.hidden_size);
+  s.x_q = WasmQ8Tensor.allocate(config.hidden_size, config.group_size);
+  s.xb = WasmF32Tensor.allocate(config.hidden_size);
+  s.xb2 = WasmF32Tensor.allocate(config.hidden_size);
+  s.hb = WasmF32Tensor.allocate(config.intermediate_size);
+  s.hb_q = WasmQ8Tensor.allocate(config.intermediate_size, config.group_size);
+  s.hb2 = WasmF32Tensor.allocate(config.intermediate_size);
+  s.q = WasmF32Tensor.allocate(config.hidden_size);
   s.k = WasmF32Tensor.allocate(kv_dim);
   s.v = WasmF32Tensor.allocate(kv_dim);
   s.att = WasmF32Tensor.allocate(config.n_heads * config.seq_len);
@@ -168,29 +108,55 @@ function forward(
   adapter_state?: AdapterRunState,
   adapter_weights?: AdapterWeights,
 ): void {
-  const kv_dim = (conf.dim * conf.n_kv_heads) / conf.n_heads;
+  const kv_dim = (conf.hidden_size * conf.n_kv_heads) / conf.n_heads;
 
-  const hidden_dim = conf.hidden_dim;
-  const head_size = conf.dim / conf.n_heads;
+  const hidden_dim = conf.intermediate_size;
+  const head_size = conf.hidden_size / conf.n_heads;
 
   const adapter_scale = adapter_config
     ? adapter_config.rank / adapter_config.alpha
     : 0;
 
   // copy the token embedding into x
-  const embeddingQuant = weights.embed_tokens.subarray(
-    token * conf.dim,
-    token * conf.dim + conf.dim,
-  );
-  const embedding = embeddingQuant.dequantize();
-  state.x.array.set(embedding);
+  if (weights.embed_tokens instanceof WasmQ8Tensor) {
+    const embeddingQuant = weights.embed_tokens.subarray(
+      token * conf.hidden_size,
+      token * conf.hidden_size + conf.hidden_size,
+    );
+    const embedding = embeddingQuant.dequantize();
+    for (let i = 0; i < conf.hidden_size; i++) {
+      state.x.array[i] = embedding[i];
+    }
+  } else {
+    const embedding = weights.embed_tokens.subarray(
+      token * conf.hidden_size,
+      token * conf.hidden_size + conf.hidden_size,
+    );
+    for (let i = 0; i < conf.hidden_size; i++) {
+      state.x.array[i] = embedding.array[i];
+    }
+  }
+
+  const embedding_scaling_factor = conf.model_type === "gemma"
+    ? Math.sqrt(conf.hidden_size)
+    : 1;
+  for (let i = 0; i < conf.hidden_size; i++) {
+    state.x.array[i] = state.x.array[i] * embedding_scaling_factor;
+  }
 
   //debugger;
   // forward all the layers
   for (let l = 0; l < conf.n_layers; l++) {
     //console.log("Layer %d", l + 1);
+
     // attention rmsnorm
-    rmsnorm(state.xb, state.x, weights.input_layernorm[l], conf.dim);
+    rmsnorm(
+      state.xb,
+      state.x,
+      weights.input_layernorm[l],
+      conf.hidden_size,
+      conf.norm_eps,
+    );
 
     // key and value point to the kv cache
     const kv_cache_layer_offset = l * conf.seq_len * kv_dim; // kv cache layer offset for convenience
@@ -206,20 +172,20 @@ function forward(
 
     // qkv matmuls for this position
     //console.log("QKV matmuls");
-    quantize(state.x_q, state.xb, conf.dim, conf.group_size);
+    quantize(state.x_q, state.xb, conf.hidden_size, conf.group_size);
     qmatmul(
       state.q,
       state.x_q,
       weights.q_proj[l],
-      conf.dim,
-      conf.dim,
+      conf.hidden_size,
+      conf.hidden_size,
       conf.group_size,
     );
     qmatmul(
       state.k,
       state.x_q,
       weights.k_proj[l],
-      conf.dim,
+      conf.hidden_size,
       kv_dim,
       conf.group_size,
     );
@@ -227,7 +193,7 @@ function forward(
       state.v,
       state.x_q,
       weights.v_proj[l],
-      conf.dim,
+      conf.hidden_size,
       kv_dim,
       conf.group_size,
     );
@@ -242,8 +208,8 @@ function forward(
           adapter_state.q_r,
           adapter_weights.q_proj_a[l],
           adapter_weights.q_proj_b[l],
-          conf.dim,
-          conf.dim,
+          conf.hidden_size,
+          conf.hidden_size,
           adapter_config.rank,
           adapter_scale,
         );
@@ -255,7 +221,7 @@ function forward(
           adapter_state.k_r,
           adapter_weights.k_proj_a[l],
           adapter_weights.k_proj_b[l],
-          conf.dim,
+          conf.hidden_size,
           kv_dim,
           adapter_config.rank,
           adapter_scale,
@@ -268,7 +234,7 @@ function forward(
           adapter_state.v_r,
           adapter_weights.v_proj_a[l],
           adapter_weights.v_proj_b[l],
-          conf.dim,
+          conf.hidden_size,
           kv_dim,
           adapter_config.rank,
           adapter_scale,
@@ -276,7 +242,15 @@ function forward(
       }
     }
 
-    rope(state.q, state.k, pos, conf.dim, kv_dim, head_size, conf.rope_theta);
+    rope(
+      state.q,
+      state.k,
+      pos,
+      conf.n_heads,
+      conf.n_kv_heads,
+      head_size,
+      conf.rope_theta,
+    );
 
     mutlihead_attention(
       state.xb,
@@ -292,20 +266,20 @@ function forward(
       state.att,
       pos,
       conf.seq_len,
-      conf.dim,
+      conf.hidden_size,
       conf.n_heads,
       conf.n_kv_heads,
     );
 
     // final matmul to get the output of the attention
     //console.log("Attention output");
-    quantize(state.x_q, state.xb, conf.dim, conf.group_size);
+    quantize(state.x_q, state.xb, conf.hidden_size, conf.group_size);
     qmatmul(
       state.xb2,
       state.x_q,
       weights.o_proj[l],
-      conf.dim,
-      conf.dim,
+      conf.hidden_size,
+      conf.hidden_size,
       conf.group_size,
     );
 
@@ -317,8 +291,8 @@ function forward(
           adapter_state.o_r,
           adapter_weights.o_proj_a[l],
           adapter_weights.o_proj_b[l],
-          conf.dim,
-          conf.dim,
+          conf.hidden_size,
+          conf.hidden_size,
           adapter_config.rank,
           adapter_scale,
         );
@@ -326,20 +300,28 @@ function forward(
     }
 
     //console.log("Residual connections");
-    accum(state.x, state.xb2, conf.dim);
+    // gemma2: post_attention_layernorm is applied before the residual connection,
+    accum(state.x, state.xb2, conf.hidden_size);
 
     //console.log("FFN rmsnorm");
-    rmsnorm(state.xb, state.x, weights.post_attention_layernorm[l], conf.dim);
+    // gemma2: pre_feedforward_layernorm is applied after the residual connection
+    rmsnorm(
+      state.xb,
+      state.x,
+      weights.post_attention_layernorm[l],
+      conf.hidden_size,
+      conf.norm_eps,
+    );
 
     //console.log("FFN Gate + Up");
     // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
     // first calculate self.w1(x) and self.w3(x)
-    quantize(state.x_q, state.xb, conf.dim, conf.group_size);
+    quantize(state.x_q, state.xb, conf.hidden_size, conf.group_size);
     qmatmul(
       state.hb,
       state.x_q,
       weights.gate_proj[l],
-      conf.dim,
+      conf.hidden_size,
       hidden_dim,
       conf.group_size,
     );
@@ -347,7 +329,7 @@ function forward(
       state.hb2,
       state.x_q,
       weights.up_proj[l],
-      conf.dim,
+      conf.hidden_size,
       hidden_dim,
       conf.group_size,
     );
@@ -360,7 +342,7 @@ function forward(
           adapter_state.gate_r,
           adapter_weights.gate_proj_a[l],
           adapter_weights.gate_proj_b[l],
-          conf.dim,
+          conf.hidden_size,
           hidden_dim,
           adapter_config.rank,
           adapter_scale,
@@ -373,7 +355,7 @@ function forward(
           adapter_state.up_r,
           adapter_weights.up_proj_a[l],
           adapter_weights.up_proj_b[l],
-          conf.dim,
+          conf.hidden_size,
           hidden_dim,
           adapter_config.rank,
           adapter_scale,
@@ -381,7 +363,15 @@ function forward(
       }
     }
 
-    silu(state.hb, hidden_dim);
+    if (conf.hidden_act === "silu") {
+      silu(state.hb, hidden_dim);
+    } else if (
+      conf.hidden_act === "gelu" || conf.hidden_act === "gelu_pytorch_tanh"
+    ) {
+      gelu(state.hb, hidden_dim);
+    } else {
+      throw new Error("Unknown hidden activation function");
+    }
 
     // elementwise multiply with w3(x)
     elemmul(state.hb, state.hb2, hidden_dim);
@@ -394,7 +384,7 @@ function forward(
       state.hb_q,
       weights.down_proj[l],
       hidden_dim,
-      conf.dim,
+      conf.hidden_size,
       conf.group_size,
     );
 
@@ -407,361 +397,44 @@ function forward(
           adapter_weights.down_proj_a[l],
           adapter_weights.down_proj_b[l],
           hidden_dim,
-          conf.dim,
+          conf.hidden_size,
           adapter_config.rank,
           adapter_scale,
         );
       }
     }
-
+    // gemma2: post_feedforward_layernorm here before the residual connection
     //console.log("Residual connections");
-    accum(state.x, state.xb, conf.dim);
+    accum(state.x, state.xb, conf.hidden_size);
   }
 
   // final rmsnorm
-  rmsnorm(state.x, state.x, weights.norm, conf.dim);
+  rmsnorm(state.x, state.x, weights.norm, conf.hidden_size, conf.norm_eps);
 
   // classifier into logits
-  quantize(state.x_q, state.x, conf.dim, conf.group_size);
-  qmatmul(
-    state.logits,
-    state.x_q,
-    weights.lm_head,
-    conf.dim,
-    conf.vocab_size,
-    conf.group_size,
-  );
-}
-
-function readTokenizer(tokenizerPath: string, vocab_size: number) {
-  let vocab = new Array<string>(vocab_size);
-  let vocab_scores = new Array<number>(vocab_size);
-  let tokBuffer = fs.readFileSync(tokenizerPath);
-  let tokBufferOffset = 0;
-  let _ignored_max_token_length = tokBuffer.readInt32LE(tokBufferOffset);
-  tokBufferOffset += 4;
-  for (let i = 0; i < Math.min(vocab_size, 32000); i++) { // TODO vocab_size is limited to 32000
-    vocab_scores[i] = tokBuffer.readFloatLE(tokBufferOffset);
-    tokBufferOffset += 4;
-
-    const token_length = tokBuffer.readInt32LE(tokBufferOffset);
-    tokBufferOffset += 4;
-
-    const bytes = new Uint8Array(token_length);
-    for (let j = 0; j < token_length; j++) {
-      bytes[j] = tokBuffer.readUInt8(tokBufferOffset);
-      tokBufferOffset += 1;
-    }
-
-    vocab[i] = new TextDecoder().decode(bytes);
+  if (weights.lm_head instanceof WasmQ8Tensor) {
+    quantize(state.x_q, state.x, conf.hidden_size, conf.group_size);
+    qmatmul(
+      state.logits,
+      state.x_q,
+      weights.lm_head,
+      conf.hidden_size,
+      conf.vocab_size,
+      conf.group_size,
+    );
+  } else {
+    matmul(
+      state.logits,
+      state.x,
+      weights.lm_head,
+      conf.hidden_size,
+      conf.vocab_size,
+    );
   }
-
-  return { vocab, vocab_scores };
+  // gemma2: self.config.final_logit_softcapping
 }
 
-function readModel(
-  hfConfig: TransformersModel<"WASM_F32">["config"],
-  hfWeights: TransformersModel<"WASM_F32">["weights"],
-) {
-  const config: Config = {
-    dim: hfConfig.hidden_size as number,
-    hidden_dim: hfConfig.intermediate_size as number,
-    head_size: hfConfig.hidden_size as number /
-      (hfConfig.num_attention_heads as number),
-    n_heads: hfConfig.num_attention_heads as number,
-    n_kv_heads: hfConfig.num_key_value_heads as number,
-    n_layers: hfConfig.num_hidden_layers as number,
-    seq_len: hfConfig.max_position_embeddings as number,
-    vocab_size: 32000, // hfConfig.vocab_size as number,
-    rope_theta: hfConfig.rope_theta as number,
-    group_size: hfConfig.group_size as number ?? JSQ8Tensor.DEFAULT_GROUP_SIZE,
-    norm_eps: hfConfig.rms_norm_eps as number,
-  };
-
-  const weights: TransformerWeights = {
-    embed_tokens: hfWeights.model.embed_tokens.weight.weights,
-    input_layernorm: hfWeights.model.layers.map((l) =>
-      l.input_layernorm.weight.weights
-    ),
-    q_proj: hfWeights.model.layers.map((l) =>
-      permuteReverse(
-        l.self_attn.q_proj?.weight.weights ??
-          l.self_attn.qkv_proj.weight.weights.subarray(
-            0,
-            config.dim * config.dim,
-          ),
-        config.n_heads,
-        config.dim,
-        config.dim,
-      )
-    ),
-    k_proj: hfWeights.model.layers.map((l) =>
-      permuteReverse(
-        l.self_attn.k_proj?.weight.weights ??
-          l.self_attn.qkv_proj.weight.weights.subarray(
-            config.dim * config.dim,
-            config.dim * config.dim +
-              config.dim *
-                (Math.floor(config.dim / config.n_heads) * config.n_kv_heads),
-          ),
-        config.n_kv_heads,
-        Math.floor(config.dim / config.n_heads) * config.n_kv_heads,
-        config.dim,
-      )
-    ),
-    v_proj: hfWeights.model.layers.map((l) =>
-      l.self_attn.v_proj?.weight.weights ??
-        l.self_attn.qkv_proj.weight.weights.subarray(
-          config.dim * config.dim +
-            config.dim *
-              (Math.floor(config.dim / config.n_heads) * config.n_kv_heads),
-          config.dim * config.dim +
-            config.dim *
-              (Math.floor(config.dim / config.n_heads) * config.n_kv_heads) * 2,
-        )
-    ),
-    o_proj: hfWeights.model.layers.map((l) =>
-      l.self_attn.o_proj.weight.weights
-    ),
-    post_attention_layernorm: hfWeights.model.layers.map((l) =>
-      l.post_attention_layernorm.weight.weights
-    ),
-    gate_proj: hfWeights.model.layers.map((l) =>
-      l.mlp.gate_proj?.weight.weights ??
-        l.mlp.gate_up_proj?.weight?.weights.subarray(
-          0,
-          config.hidden_dim * config.dim,
-        )
-    ),
-    down_proj: hfWeights.model.layers.map((l) =>
-      l.mlp.down_proj.weight.weights
-    ),
-    up_proj: hfWeights.model.layers.map((l) =>
-      l.mlp.up_proj?.weight?.weights ??
-        l.mlp.gate_up_proj?.weight.weights.subarray(
-          config.hidden_dim * config.dim,
-          2 * config.hidden_dim * config.dim,
-        )
-    ),
-    norm: hfWeights.model.norm.weight.weights,
-    lm_head: hfWeights.lm_head?.weight?.weights ??
-      hfWeights.model.embed_tokens.weight.weights,
-  };
-
-  return { config, weights };
-}
-
-function readModelQuantized(
-  hfConfig: TransformersModel<"WASM_F32">["config"],
-  hfWeights: TransformersModel<"WASM_F32">["weights"],
-  hfWeightsQuant: TransformersModel<"WASM_Q8_0">["weights"],
-  hfMetadata: TransformersModel<"WASM_Q8_0">["metadata"],
-) {
-  const config: Config = {
-    dim: hfConfig.hidden_size as number,
-    hidden_dim: hfConfig.intermediate_size as number,
-    head_size: hfConfig.hidden_size as number /
-      (hfConfig.num_attention_heads as number),
-    n_heads: hfConfig.num_attention_heads as number,
-    n_kv_heads: hfConfig.num_key_value_heads as number,
-    n_layers: hfConfig.num_hidden_layers as number,
-    seq_len: hfConfig.max_position_embeddings as number,
-    vocab_size: 32000, // hfConfig.vocab_size as number,
-    rope_theta: hfConfig.rope_theta as number,
-    group_size: parseInt(
-      hfMetadata.group_size ?? JSQ8Tensor.DEFAULT_GROUP_SIZE.toString(),
-    ),
-    norm_eps: hfConfig.rms_norm_eps as number,
-  };
-
-  const weights: QuantizedTransformerWeights = {
-    embed_tokens: hfWeightsQuant.model.embed_tokens.weight.weights,
-
-    input_layernorm: hfWeights.model.layers.map((l) =>
-      l.input_layernorm.weight.weights
-    ),
-    q_proj: hfWeightsQuant.model.layers.map((l) =>
-      permuteReverse(
-        l.self_attn.q_proj?.weight.weights ??
-          l.self_attn.qkv_proj.weight.weights.subarray(
-            0,
-            config.dim * config.dim,
-          ),
-        config.n_heads,
-        config.dim,
-        config.dim,
-      )
-    ),
-    k_proj: hfWeightsQuant.model.layers.map((l) =>
-      permuteReverse(
-        l.self_attn.k_proj?.weight.weights ??
-          l.self_attn.qkv_proj.weight.weights.subarray(
-            config.dim * config.dim,
-            config.dim * config.dim +
-              config.dim *
-                (Math.floor(config.dim / config.n_heads) * config.n_kv_heads),
-          ),
-        config.n_kv_heads,
-        Math.floor(config.dim / config.n_heads) * config.n_kv_heads,
-        config.dim,
-      )
-    ),
-    v_proj: hfWeightsQuant.model.layers.map(
-      (l) =>
-        l.self_attn.v_proj?.weight.weights ??
-          l.self_attn.qkv_proj.weight.weights.subarray(
-            config.dim * config.dim +
-              config.dim *
-                (Math.floor(config.dim / config.n_heads) * config.n_kv_heads),
-            config.dim * config.dim +
-              config.dim *
-                (Math.floor(config.dim / config.n_heads) * config.n_kv_heads) *
-                2,
-          ),
-    ),
-    o_proj: hfWeightsQuant.model.layers.map(
-      (l) => l.self_attn.o_proj.weight.weights,
-    ),
-    post_attention_layernorm: hfWeights.model.layers.map((l) =>
-      l.post_attention_layernorm.weight.weights
-    ),
-    gate_proj: hfWeightsQuant.model.layers.map(
-      (l) =>
-        l.mlp.gate_proj?.weight.weights ??
-          l.mlp.gate_up_proj?.weight?.weights.subarray(
-            0,
-            config.hidden_dim * config.dim,
-          ),
-    ),
-    down_proj: hfWeightsQuant.model.layers.map(
-      (l) => l.mlp.down_proj.weight.weights,
-    ),
-    up_proj: hfWeightsQuant.model.layers.map(
-      (l) =>
-        l.mlp.up_proj?.weight?.weights ??
-          l.mlp.gate_up_proj?.weight.weights.subarray(
-            config.hidden_dim * config.dim,
-            2 * config.hidden_dim * config.dim,
-          ),
-    ),
-    norm: hfWeights.model.norm.weight.weights,
-    lm_head: hfWeightsQuant.lm_head?.weight?.weights ??
-      hfWeightsQuant.model.embed_tokens.weight.weights,
-  };
-  return { config, weights };
-}
-
-function readAdapter(
-  hfConfig: TransformersModel<"WASM_F32">["config"],
-  hfAdapterConfig: TransformersModel<"WASM_F32">["config"],
-  hfAdapterWeights: TransformersModel<"WASM_F32">["weights"],
-) {
-  const adapterConfig: AdapterConfig = {
-    rank: hfAdapterConfig.r as number,
-    alpha: hfAdapterConfig.lora_alpha as number,
-  };
-
-  const adapterWeights: AdapterWeights = {
-    q_proj_a: (hfAdapterConfig.target_modules as string[]).includes("q_proj")
-      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-        permuteReverse(
-          l.self_attn.q_proj.lora_A.weight.weights,
-          hfConfig.num_attention_heads as number,
-          hfConfig.hidden_size as number,
-          hfAdapterConfig.r as number,
-        )
-      )
-      : undefined,
-    q_proj_b: (hfAdapterConfig.target_modules as string[]).includes("q_proj")
-      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-        permuteReverse(
-          l.self_attn.q_proj.lora_B.weight.weights,
-          hfConfig.num_attention_heads as number,
-          hfConfig.hidden_size as number,
-          hfAdapterConfig.r as number,
-        )
-      )
-      : undefined,
-    k_proj_a: (hfAdapterConfig.target_modules as string[]).includes("k_proj")
-      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-        permuteReverse(
-          l.self_attn.k_proj.lora_A.weight.weights,
-          hfConfig.num_attention_heads as number,
-          hfConfig.hidden_size as number,
-          hfAdapterConfig.r as number,
-        )
-      )
-      : undefined,
-    k_proj_b: (hfAdapterConfig.target_modules as string[]).includes("k_proj")
-      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-        permuteReverse(
-          l.self_attn.k_proj.lora_B.weight.weights,
-          hfConfig.num_attention_heads as number,
-          hfConfig.hidden_size as number,
-          hfAdapterConfig.r as number,
-        )
-      )
-      : undefined,
-    v_proj_a: (hfAdapterConfig.target_modules as string[]).includes("v_proj")
-      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-        l.self_attn.v_proj.lora_A.weight.weights
-      )
-      : undefined,
-    v_proj_b: (hfAdapterConfig.target_modules as string[]).includes("v_proj")
-      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-        l.self_attn.v_proj.lora_B.weight.weights
-      )
-      : undefined,
-    o_proj_a: (hfAdapterConfig.target_modules as string[]).includes("o_proj")
-      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-        l.self_attn.o_proj.lora_A.weight.weights
-      )
-      : undefined,
-    o_proj_b: (hfAdapterConfig.target_modules as string[]).includes("o_proj")
-      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-        l.self_attn.o_proj.lora_B.weight.weights
-      )
-      : undefined,
-    gate_proj_a:
-      (hfAdapterConfig.target_modules as string[]).includes("gate_proj")
-        ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-          l.mlp.gate_proj.lora_A.weight.weights
-        )
-        : undefined,
-    gate_proj_b:
-      (hfAdapterConfig.target_modules as string[]).includes("gate_proj")
-        ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-          l.mlp.gate_proj.lora_B.weight.weights
-        )
-        : undefined,
-    down_proj_a:
-      (hfAdapterConfig.target_modules as string[]).includes("down_proj")
-        ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-          l.mlp.down_proj.lora_A.weight.weights
-        )
-        : undefined,
-    down_proj_b:
-      (hfAdapterConfig.target_modules as string[]).includes("down_proj")
-        ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-          l.mlp.down_proj.lora_B.weight.weights
-        )
-        : undefined,
-    up_proj_a: (hfAdapterConfig.target_modules as string[]).includes("up_proj")
-      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-        l.mlp.up_proj.lora_A.weight.weights
-      )
-      : undefined,
-    up_proj_b: (hfAdapterConfig.target_modules as string[]).includes("up_proj")
-      ? hfAdapterWeights.base_model.model.model.layers.map((l) =>
-        l.mlp.up_proj.lora_B.weight.weights
-      )
-      : undefined,
-  };
-
-  return { adapterConfig, adapterWeights };
-}
-
-function main() {
+async function main() {
   //console.log(Deno.args);
   const [checkpoint, ...args] = Deno.args;
   let temperature = 1.0; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
@@ -770,6 +443,7 @@ function main() {
   let steps = 256; // max number of steps to run for, 0: use seq_len
   let prompt: string | null = null; // prompt string
   let adapter = null;
+  let direct_read = false;
 
   if (!checkpoint) return error_usage();
   for (let i = 0; i < args.length; i += 2) {
@@ -797,6 +471,9 @@ function main() {
       case "a":
         adapter = val;
         break;
+      case "d":
+        direct_read = true;
+        break;
       default:
         return error_usage();
     }
@@ -804,59 +481,22 @@ function main() {
   set_seed(rng_seed || Date.now());
 
   console.log('Loading model from "%s"...', checkpoint);
-  const { config: hfConfig, metadata: hfMetadata, weights: hfWeightsQuant } =
-    readHFRepo(
-      checkpoint + "/config.json",
-      checkpoint + "/model.safetensors",
-      "WASM_Q8_0",
-      {
-        filter: (layer) =>
-          ["_proj.", "lm_head.", "embed_tokens."].some((needle) =>
-            layer.includes(needle)
-          ),
-      },
-    );
-  const { weights: hfWeights } = readHFRepo(
-    checkpoint + "/config.json",
-    checkpoint + "/model.safetensors",
-    "WASM_F32",
-    {
-      filter: (layer) =>
-        !["_proj.", "lm_head.", "embed_tokens."].some((needle) =>
-          layer.includes(needle)
-        ),
-    },
-  );
-  const { config, weights } = readModelQuantized(
-    hfConfig,
-    hfWeights,
-    hfWeightsQuant,
-    hfMetadata,
-  );
+  const { config, weights } = await readModel(checkpoint, direct_read);
 
   let adapterConfig;
   let adapterWeights;
   if (adapter) {
     console.log('Loading adapter from "%s"...', adapter);
-    const { config: hfAdapterConfig, weights: hfAdapterWeights } = readHFRepo(
-      adapter + "/adapter_config.json",
-      adapter + "/adapter_model.safetensors",
-      "WASM_F32",
-    );
-    const model = readAdapter(
-      hfConfig,
-      hfAdapterConfig,
-      hfAdapterWeights,
-    );
-    adapterConfig = model.adapterConfig;
-    adapterWeights = model.adapterWeights;
+    //const adptr = readAdapter(adapter, config); // TODO this needs to be a hf config, but we don't have that here anymore
+    //adapterConfig = adptr.adapterConfig;
+    //adapterWeights = adptr.adapterWeights;
   }
 
   // read in the tokenizer.bin file
   console.log("Loading tokenizer from tokenizer.bin...");
-  const { vocab, vocab_scores } = readTokenizer(
-    "tokenizer.bin",
-    config.vocab_size,
+  const hfTokenizer = readHFRepoTokenizer(
+    checkpoint + "/tokenizer_config.json",
+    checkpoint + "/tokenizer.json",
   );
 
   // right now we cannot run for more than config.seq_len steps
@@ -869,18 +509,11 @@ function main() {
     : undefined;
   if (prompt == null) prompt = "";
 
-  // encode the (string) prompt into tokens sequence
-  let num_prompt_tokens = 0;
-  let prompt_tokens: Int32Array = new Int32Array(prompt.length + 3); // +3 for '\0', ?BOS, ?EOS
-
-  num_prompt_tokens = encode(
+  const prompt_tokens = encode(
     prompt,
-    true, // bos
-    false, // no eos
-    vocab,
-    vocab_scores,
-    prompt_tokens,
+    hfTokenizer,
   );
+  console.log("Prompt tokens:", prompt_tokens);
   //console.log(prompt_tokens, num_prompt_tokens);
 
   // start the main loop
@@ -906,7 +539,7 @@ function main() {
     //console.log("Step %d decoding", pos + 1);
 
     // advance the state machine
-    if (pos < num_prompt_tokens - 1) {
+    if (pos < prompt_tokens.length - 1) {
       // if we are still processing the input prompt, force the next prompt token
       next = prompt_tokens[pos + 1];
     } else {
@@ -920,11 +553,12 @@ function main() {
     }
     pos++;
 
-    // data-dependent terminating condition: the BOS (1) token delimits sequences
-    if (next == 1) break;
+    // data-dependent terminating condition: the BOS (1) or EOS (2) token delimits sequences
+    //if (next == 1) break;
+    //if (next == 2) break;
 
     // print the token as string, decode it with the Tokenizer object
-    const piece = decode(vocab, token, next);
+    const piece = decode(token, next, hfTokenizer);
 
     writeAllSync(Deno.stdout, new TextEncoder().encode(piece)); // note: assumes utf8 terminal
     token = next;

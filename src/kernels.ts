@@ -21,6 +21,7 @@ export function rmsnorm(
   x_t: F32Tensor,
   weight_t: F32Tensor,
   size: number,
+  eps: number,
 ): void {
   const o = o_t.array;
   const x = x_t.array;
@@ -29,7 +30,7 @@ export function rmsnorm(
   let ss = 0;
   for (let j = 0; j < size; j++) ss += x[j] * x[j];
   ss /= size;
-  ss = 1.0 / Math.sqrt(1e-5 + ss);
+  ss = 1.0 / Math.sqrt(eps + ss);
   for (let j = 0; j < size; j++) o[j] = weight[j] * (ss * x[j]);
 }
 
@@ -209,9 +210,46 @@ export function qmatmuladd(
 export function silu(x_t: F32Tensor, size: number): void {
   const x = x_t.array;
 
+  /*
+  def sigmoid(x_elem):
+    return 1/(1 + np.exp(-x_elem))
+
+  def silu(x, theda = 1.0):
+      return [x_elem * sigmoid(theda *x_elem) for x_elem in x]
+  */
+
   // F.silu; silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
   for (let i = 0; i < size; i++) {
     x[i] = x[i] * (1.0 / (1.0 + Math.exp(-x[i])));
+  }
+}
+
+export function gelu(x_t: F32Tensor, size: number): void {
+  const x = x_t.array;
+
+  /*
+  def gelu(x):
+      return [0.5 * z * (1 + math.tanh(math.sqrt(2 / np.pi) * (z + 0.044715 * math.pow(z, 3)))) for z in x]
+  */
+
+  // F.gelu; gelu(x)=0.5*x*(1+tanh(sqrt(2/π)*(x+0.044715*x^3)))
+  const sqrt2_over_pi = Math.sqrt(2.0 / Math.PI);
+  for (let i = 0; i < size; i++) {
+    const z = x[i];
+    x[i] = 0.5 * z *
+      (1 + Math.tanh(sqrt2_over_pi * (z + 0.044715 * z * z * z)));
+  }
+}
+
+export function geglu(x_t: F32Tensor, size: number): void {
+  const x = x_t.array;
+
+  // F.geglu; GeGLU(x) = x sigmoid(x) + x 0.5 (1 + tanh[sqrt(2/pi) (x + 0.044715 x³)])
+  const sqrt2_over_pi = Math.sqrt(2.0 / Math.PI);
+  for (let i = 0; i < size; i++) {
+    const z = x[i];
+    x[i] = z * (1.0 / (1.0 + Math.exp(-z))) +
+      z * 0.5 * (1 + Math.tanh(sqrt2_over_pi * (z + 0.044715 * z * z * z)));
   }
 }
 
