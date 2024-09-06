@@ -16,7 +16,8 @@ Based on the Andrej Karpathy's [llama2.c].
 
 deno:
 ```sh
-deno run --allow-all llama2.ts ./path/to/model -s 1 -t 0 -i "Once upon a time"
+git clone https://huggingface.co/nickypro/tinyllama-15M
+deno run --allow-all llama2.ts ./tinyllama-15M -s 1 -t 0 -i "Once upon a time"
 ```
 
 Arguments:
